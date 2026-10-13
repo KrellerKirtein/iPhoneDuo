@@ -1,0 +1,12 @@
+{
+  "billingReview": {
+    "installmentReview": {
+      "d": {
+        "labelImageAlt": "招商银行",
+        "description": "24 个月，每月约 RMB 534",
+        "installment": true,
+        "sectionHeader": "分期付款方案："
+      }
+    }
+  }
+}

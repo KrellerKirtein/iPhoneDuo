@@ -10,17 +10,20 @@ def private_fd(fd):
 
 
 def browser_candidates(platform=None, environ=None):
+    """按 Edge 优先、Chrome 回退的顺序查找各安装位置。"""
     platform = platform or sys.platform
     env = os.environ if environ is None else environ
     if platform == 'darwin':
         return [Path(root) / name / 'Contents/MacOS' / exe
-                for root in ('/Applications', str(Path.home() / 'Applications'))
-                for name, exe in [('Google Chrome.app', 'Google Chrome'),
-                                  ('Microsoft Edge.app', 'Microsoft Edge')]]
+                for name, exe in [('Microsoft Edge.app', 'Microsoft Edge'),
+                                  ('Google Chrome.app', 'Google Chrome')]
+                for root in ('/Applications', str(Path.home() / 'Applications'))]
     if platform == 'win32':
-        return [Path(env[root]) / suffix for root in ('PROGRAMFILES', 'PROGRAMFILES(X86)', 'LOCALAPPDATA')
-                if env.get(root) for suffix in ('Google/Chrome/Application/chrome.exe',
-                                                'Microsoft/Edge/Application/msedge.exe')]
+        return [Path(env[root]) / suffix
+                for suffix in ('Microsoft/Edge/Application/msedge.exe',
+                               'Google/Chrome/Application/chrome.exe')
+                for root in ('PROGRAMFILES', 'PROGRAMFILES(X86)', 'LOCALAPPDATA')
+                if env.get(root)]
     return []
 
 

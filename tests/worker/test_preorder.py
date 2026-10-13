@@ -143,6 +143,45 @@ class PreorderTests(unittest.TestCase):
         self.assertEqual(self.factory.call_count, 1)
         self.qr.assert_not_called()
 
+    def test_empty_limit_order_resumes_after_restart_without_payment(self):
+        with patch.object(shop, 'ensure_strong_login', side_effect=Cancelled()), self.assertRaises(Cancelled):
+            self.service.run('preorder', params(max_total=''))
+        saved = preorder.PlanStore(self.root).data
+        self.assertEqual(saved['state'], 'paused')
+        self.assertIsNone(saved['plan']['max_total_cents'])
+        self.factory.assert_not_called()
+        restarted = Service(self.channel, self.root, self.task, 'test@example.invalid', Mock())
+        result = restarted.run('preorder_resume', {})
+        self.assertEqual(result['status'], 'pending_payment')
+        self.assertEqual(self.flow.submissions, 1)
+        self.assertEqual(preorder.PlanStore(self.root).data['state'], 'confirmed')
+        self.qr.assert_not_called()
+
+    def test_empty_or_omitted_limit_is_unlimited(self):
+        for maximum in ('', '   ', None):
+            with self.subTest(maximum=maximum):
+                self.assertIsNone(preorder.validate_plan(params(max_total=maximum))['max_total_cents'])
+        data = params()
+        del data['max_total']
+        self.assertIsNone(preorder.validate_plan(data)['max_total_cents'])
+
+    def test_optional_limit_preserves_amount_validation_and_explicit_cap(self):
+        for maximum in ('', '21499'):
+            policy = self.policy(max_total=maximum)
+            for total in ('', 'USD 100', 'NaN', '0', '-1'):
+                with self.subTest(maximum=maximum, total=total), self.assertRaises(ValueError):
+                    policy.confirm({**REVIEW, 'total': total})
+            self.assertIsNone(policy.review)
+            self.assertTrue(policy.confirm({**REVIEW, 'total': 'RMB 21498.99'}))
+            self.assertTrue(policy.confirm(deepcopy(REVIEW)))
+            if maximum:
+                with self.assertRaisesRegex(ValueError, '超过计划上限'):
+                    policy.confirm({**REVIEW, 'total': 'RMB 21499.01'})
+            else:
+                self.assertTrue(policy.confirm({**REVIEW, 'total': 'RMB 999999'}))
+            with self.assertRaisesRegex(ValueError, '返回金额与复核金额不同'):
+                policy.validate_result({**PAYMENT, 'amount_due': 'RMB 1'})
+
     def test_invisible_order_stays_sealed_after_restart_and_manual_purchase_blocked(self):
         self.failure = requests.Timeout()
         self.assertEqual(self.service.run('preorder', params())['status'], 'order_uncertain')
@@ -294,7 +333,8 @@ class PreorderTests(unittest.TestCase):
                 policy.confirm({**REVIEW, **changes})
         self.assertIsNone(policy.review)
         for changes in ({'authorized': False}, {'sku': None}, {'quantity': True}, {'quantity': 2},
-                        {'max_total': 'NaN'}, {'max_total': '1,,000'}, {'window_seconds': 901},
+                        {'max_total': 'NaN'}, {'max_total': '1,,000'}, {'max_total': '0'}, {'max_total': '-1'},
+                        {'window_seconds': 901},
                         {'target_at': '2026-10-16T20:00:00'}, {'pickup_stores': ['R580'], 'id_suffix': ''}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 preorder.validate_plan(params(**changes))

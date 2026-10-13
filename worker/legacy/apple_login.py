@@ -39,6 +39,13 @@ class LoginError(Exception):
         self.codes = tuple(codes)
 
 
+def is_credentials_error(error):
+    """识别 Apple 拒绝账号凭据的响应，并兼容业务层的异常包装。"""
+    cause = error if isinstance(error, LoginError) else getattr(error, "__cause__", None)
+    return (isinstance(cause, LoginError) and cause.status == 401
+            and bool({"-20101", "-20283"}.intersection(cause.codes)))
+
+
 def browser_profile_path(auth_path=None):
     auth_path = Path(auth_path).expanduser() if auth_path is not None else None
     root = auth_path.parent if auth_path else Path(__file__).resolve().parent
@@ -192,9 +199,9 @@ class AppleStoreLogin:
     def prepare_browser_profile(self):
         profile = self.browser_profile
         if (profile / ".authx-541").exists():
-            # 不移动仍被 Chrome 使用的配置，也不删除旧数据。
+            # 不移动仍被浏览器使用的配置，也不删除旧数据。
             if os.path.lexists(profile / "SingletonLock"):
-                raise LoginError("待重建的专用 Chrome 配置仍有进程锁，请先关闭该浏览器后重试。")
+                raise LoginError("待重建的专用浏览器配置仍有进程锁，请先关闭该浏览器后重试。")
             backup = profile.with_name("native-rejected-" + uuid.uuid4().hex)
             profile.rename(backup)
             print(f"上次商城回调返回 541，旧浏览器配置已保留至 {backup}，本次重新取得上下文。")
@@ -212,7 +219,7 @@ class AppleStoreLogin:
         except ImportError:
             raise LoginError("首次获取浏览器 Cookie 需要 Playwright，请使用当前 Python 安装 requirements.txt。") from None
         try:
-            chrome = find_browser()
+            browser_executable = find_browser()
         except ValueError as error:
             raise LoginError(str(error)) from None
         proxies = requests.utils.get_environ_proxies(HOME)
@@ -223,7 +230,7 @@ class AppleStoreLogin:
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
-        args = [str(chrome), "--user-data-dir=" + str(profile),
+        args = [str(browser_executable), "--user-data-dir=" + str(profile),
                 "--remote-debugging-port=" + str(port), "--remote-debugging-address=127.0.0.1",
                 "--restore-last-session", "--no-first-run", "--no-default-browser-check",
                 "--window-size=500,640"]
@@ -232,7 +239,7 @@ class AppleStoreLogin:
             if parsed.username or parsed.password:
                 raise LoginError("自动获取上下文暂不支持需要账号密码的代理，请使用本机无认证代理。")
             args.append("--proxy-server=" + proxy_url)
-        print(f"正常启动 Chrome，使用专用配置：{profile}。自动获取上下文后关闭并保留浏览器数据。")
+        print(f"正常启动浏览器 {browser_executable.name}，使用专用配置：{profile}。自动获取上下文后关闭并保留浏览器数据。")
         process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         interaction.report_stage("正在获取浏览器上下文", browser_pid=process.pid)
         try:
@@ -241,7 +248,7 @@ class AppleStoreLogin:
                 deadline = time.monotonic() + 30
                 while browser is None:
                     if process.poll() is not None or time.monotonic() >= deadline:
-                        raise LoginError("未能连接脚本启动的 Chrome，请关闭占用专用配置的浏览器后重试。")
+                        raise LoginError("未能连接脚本启动的浏览器，请关闭占用专用配置的浏览器后重试。")
                     try:
                         browser = playwright.chromium.connect_over_cdp(
                             f"http://127.0.0.1:{port}", timeout=1000, no_defaults=True)
@@ -254,7 +261,7 @@ class AppleStoreLogin:
                     for url in (HOME, HOME + "shop/bag"):
                         reply = page.goto(url, wait_until="load", timeout=45000)
                         if reply is None or reply.status >= 400:
-                            raise LoginError("Chrome 未能正常打开官网页面，未更新上下文。")
+                            raise LoginError("浏览器未能正常打开官网页面，未更新上下文。")
                     for _ in range(80):
                         cookies = context.cookies()
                         if any(c["name"] == "shld_bt_ck" and c["value"]
@@ -263,11 +270,11 @@ class AppleStoreLogin:
                             break
                         page.wait_for_timeout(250)
                     else:
-                        raise LoginError("Chrome 尚未取得所需浏览器上下文，已停止；请检查浏览器页面或代理后重试。")
+                        raise LoginError("浏览器尚未取得所需浏览器上下文，已停止；请检查浏览器页面或代理后重试。")
                     user_agent = page.evaluate("navigator.userAgent")
                 finally:
                     # 关闭专用配置中本次及历史恢复的标签页，避免下次启动继续累积。
-                    # 保留 restore-last-session，让 Chrome 继续持久保存会话 Cookie。
+                    # 保留 restore-last-session，让浏览器继续持久保存会话 Cookie。
                     for owned_context in browser.contexts:
                         for opened_page in list(owned_context.pages):
                             try:
@@ -279,7 +286,7 @@ class AppleStoreLogin:
                     except BrowserError:
                         pass
         except BrowserError:
-            raise LoginError("Chrome 初始化失败，请检查网络/代理及专用浏览器配置。") from None
+            raise LoginError("浏览器初始化失败，请检查网络/代理及专用浏览器配置。") from None
         finally:
             try:
                 process.wait(timeout=10)
@@ -308,7 +315,7 @@ class AppleStoreLogin:
                 rest={"HttpOnly": None} if c.get("httpOnly") else {}))
             count += 1
         self.session.headers.update({"User-Agent": user_agent, "Accept-Language": "zh-CN,zh;q=0.9"})
-        print(f"Chrome 初始化完成，已取得 {count} 个商城上下文 Cookie。")
+        print(f"浏览器初始化完成，已取得 {count} 个商城上下文 Cookie。")
         log.info("[浏览器上下文] 初始化耗时 %.2fs", time.monotonic() - started)
         return True
 
@@ -437,10 +444,10 @@ class AppleStoreLogin:
         try:
             data = self.expect(response, allowed)
         except LoginError as error:
-            if error.status == 401 and "-20101" in error.codes:
+            if is_credentials_error(error):
                 config_path = self.auth_path or "auth.json"
                 raise LoginError(
-                    "Apple 账号或密码验证失败（HTTP 401，错误代码 -20101）。"
+                    f"Apple 账号或密码验证失败（HTTP 401，错误代码 {', '.join(error.codes)}）。"
                     f"请检查 {config_path} 中的 account 和 password，注意大小写、输入法及首尾空格；"
                     "修改后重新运行 -l。若确认账密正确，请先在官网验证登录；此错误不一定由密码输错导致。",
                     status=error.status, codes=error.codes) from None
@@ -618,7 +625,7 @@ class AppleStoreLogin:
         config = json.loads(self.auth_path.read_text(encoding="utf-8"))
         for group, cookies in config.get("cookies", {}).items():
             config["cookies"][group] = [c for c in cookies if not is_auth(c["name"], c["domain"])]
-        if isinstance(error, LoginError) and error.status == 401 and "-20101" in error.codes:
+        if is_credentials_error(error):
             config["trust_account"] = config.get("trust_account") or config.get("account", "")
             config["account"] = ""
             config["password"] = ""
@@ -639,11 +646,14 @@ class AppleStoreLogin:
             self.discard_failed_login(error)
             if isinstance(error, LoginError) and (error.status is None or error.status in (400, 401, 403, 409, 541)):
                 interaction.report_stage("重新认证未通过", authentication_failed=True)
-            if isinstance(error, LoginError) and error.status == 401 and "-20101" in error.codes:
+            if is_credentials_error(error):
+                retry_hint = ("请点击“继续登录”重新输入 Apple 账号的日常登录密码。"
+                              if interaction.handler is not None else
+                              "已清空本地账密及登录 Cookie，下次运行将重新输入账号和密码。")
                 raise LoginError(
-                    "Apple 账号或密码验证失败（HTTP 401，错误代码 -20101）。"
-                    "已清空本地账密及登录 Cookie，下次运行将重新输入账号和密码；"
-                    "其他配置和设备信任已保留。此错误不一定由密码输错导致。",
+                    f"Apple 账号或密码验证失败（HTTP 401，错误代码 {', '.join(error.codes)}）。"
+                    + retry_hint + "其他配置和设备信任已保留。"
+                    "若同一账号和密码可以在 Apple 官网登录，请进一步检查本地认证流程。",
                     status=error.status, codes=error.codes) from None
             raise
 
@@ -715,6 +725,10 @@ class AppleStoreLogin:
         response = self.request("POST", self.callback, data={"grantCode": ""}, headers=headers)
         if response.status_code == 541:
             self.mark_rejected_browser_context()
+            raise LoginError(
+                "Apple 账号认证已通过，但商城登录回调被拒绝（HTTP 541），账号尚未添加成功。"
+                "请点击“继续登录”再试一次；下次会备份旧浏览器配置并创建新配置。"
+                "若仍然失败，请保留任务日志以继续排查。", status=541)
         data = self.expect(response, (200,))
         head = data.get("head", {}) if isinstance(data, dict) else {}
         target = head.get("data", {}).get("url")

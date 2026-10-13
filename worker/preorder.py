@@ -9,6 +9,7 @@ import requests
 
 import checkout_options as options
 import duo_killer as shop
+import payment_options
 
 
 SEALED = {'submitting', 'uncertain', 'confirmed'}
@@ -45,13 +46,17 @@ def parse_time(value):
 
 
 def validate_plan(data):
-    """冻结用户授权的 SKU、数量、金额和门店范围。"""
+    """冻结用户授权的购买范围；金额上限留空时保存为 None。"""
     if not isinstance(data, dict) or not isinstance(data.get('sku'), str):
         raise ValueError('购买计划和商品 SKU 格式无效。')
     if data.get('authorized') is not True:
         raise ValueError('请先授权按计划自动创建订单；程序不会付款。')
+    payment = payment_options.validate(data.get('payment_method', 'alipay'), data.get('installment_term'))
     target = parse_time(data.get('target_at'))
     quantity = data.get('quantity', 1)
+    applecare = data.get('applecare', False)
+    if type(applecare) is not bool:
+        raise ValueError('AppleCare 选项必须是勾选状态。')
     if type(quantity) is not int or quantity != 1:
         raise ValueError('定时计划每次只购买 1 件商品。')
     duration = data.get('window_seconds', 300)
@@ -64,9 +69,11 @@ def validate_plan(data):
     suffix = data.get('id_suffix', '') if stores else ''
     if stores and (not isinstance(suffix, str) or not re.fullmatch(r'[0-9A-Za-z]{4}', suffix)):
         raise ValueError('启用取货备选须填写取货人证件后四位。')
-    return {'sku': shop.normalize_sku(data.get('sku', '')), 'quantity': quantity,
+    maximum = data.get('max_total')
+    max_total_cents = None if maximum is None or str(maximum).strip() == '' else money(maximum)
+    return {'sku': shop.normalize_sku(data.get('sku', '')), 'quantity': quantity, 'applecare': applecare, **payment,
             'target_at': target.isoformat(), 'window_seconds': duration,
-            'max_total_cents': money(data.get('max_total', '')),
+            'max_total_cents': max_total_cents,
             'pickup_stores': list(dict.fromkeys(stores)), 'id_suffix': suffix.upper(),
             'authorized': True}
 
@@ -94,6 +101,8 @@ class PlanStore:
         plan = self.data['plan']
         return {'success': True, 'status': 'preorder_plan', 'state': self.data['state'],
                 'target_at': plan['target_at'], 'sku': plan['sku'],
+                'payment_label': payment_options.description(payment_options.validate(
+                    plan.get('payment_method', 'alipay'), plan.get('installment_term'))),
                 'order_number': self.data.get('result', {}).get('order_number'),
                 'message': self.data.get('message', '')}
 
@@ -123,11 +132,17 @@ class Policy:
 
     def confirm(self, details):
         """核对整个购物袋、送货街道或门店及金额；省市区在地址步骤按快照提交。"""
+        expected_payment = payment_options.validate(self.plan.get('payment_method', 'alipay'), self.plan.get('installment_term'))
+        actual_payment = payment_options.validate(details.get('payment_method', 'alipay'), details.get('installment_term'))
+        if actual_payment != expected_payment:
+            raise ValueError('付款方式或期数与购买计划不同，未自动提交。')
         items = details.get('items', [])
         if (len(items) != 1 or shop.normalize_sku(items[0].get('sku', '')) != self.plan['sku']
                 or items[0].get('quantity') != self.plan['quantity']):
             raise ValueError('订单商品或数量与购买计划不同，未自动提交。')
-        if money(details.get('total', '')) > self.plan['max_total_cents']:
+        total_cents = money(details.get('total', ''))
+        maximum = self.plan['max_total_cents']
+        if maximum is not None and total_cents > maximum:
             raise ValueError('订单金额超过计划上限，未自动提交。')
         if not items[0].get('name'):
             raise ValueError('订单商品名称缺失，无法在超时后核对订单。')
@@ -335,6 +350,9 @@ def run(service, params, *, resume=False):
         raise ValueError('尚未保存可恢复的购买计划。')
     sealed = store.data['state'] in SEALED
     service.submitted = sealed
+    if not sealed:
+        payment_options.validate(store.data['plan'].get('payment_method', 'alipay'),
+                                 store.data['plan'].get('installment_term'))
     service.ensure_auth_file()
     with requests.Session() as session:
         shop.load_auth(session, json.loads(service.auth.read_text(encoding='utf-8')))
@@ -388,7 +406,9 @@ def run(service, params, *, resume=False):
                     if any(sku.upper() != policy.plan['sku'] for sku, _ in items):
                         raise ValueError('购物袋包含计划以外的商品，请先人工处理。')
                     shop.add_to_bag(policy.plan['sku'], quantity=1, set_total=True, flow=flow)
-                    result = shop.pay_bag(flow=flow)
+                    shop.configure_applecare(flow, policy.plan['sku'], policy.plan.get('applecare', False))
+                    result = shop.pay_bag(flow=flow, payment_method=policy.plan.get('payment_method', 'alipay'),
+                                          installment_term=policy.plan.get('installment_term'))
                     policy.validate_result(result)
                     store.save(state='confirmed', result=result, message='订单已创建，等待付款。')
                     return result

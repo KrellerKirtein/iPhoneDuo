@@ -33,6 +33,7 @@ import { RemoveAccountDialog } from "./RemoveAccountDialog";
 import { SelectField } from "./SelectField";
 import { ActiveTaskNav } from "./ActiveTaskNav";
 import { PreorderForm } from "./PreorderForm";
+import { PaymentOptions, type PaymentMethod } from "./PaymentOptions";
 import {
   active,
   LOCAL_ID,
@@ -78,6 +79,13 @@ export default function App() {
   const [dispatching, setDispatching] = useState(false);
   const [sku, setSku] = useState("MK2U4CH");
   const [quantity, setQuantity] = useState(2);
+  const [applecare, setApplecare] = useState(false);
+  const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>("alipay");
+  const [installmentTerm, setInstallmentTerm] = useState(24);
+  const paymentParams = {
+    payment_method: paymentMethod,
+    installment_term: paymentMethod === "alipay" ? null : installmentTerm,
+  };
   const [taskTarget, setTaskTarget] = useState<Task | null>(null);
   const [focusTaskId, setFocusTaskId] = useState("");
   const [removingAccount, setRemovingAccount] = useState<Account | null>(null);
@@ -147,6 +155,11 @@ export default function App() {
     setSku(account?.preset_sku || "MK2U4CH");
     setQuantity(account?.preset_quantity || 2);
   }, [account?.id, account?.preset_sku, account?.preset_quantity]);
+  useEffect(() => setApplecare(false), [account?.id, sku]);
+  useEffect(() => {
+    setPaymentMethod("alipay");
+    setInstallmentTerm(24);
+  }, [account?.id]);
   const tasks = snapshot.tasks
     .filter((t) => t.account_id === accountId)
     .sort((a, b) => b.created_at - a.created_at || b.updated_at - a.updated_at);
@@ -565,7 +578,12 @@ export default function App() {
                         <form
                           onSubmit={(e) => {
                             e.preventDefault();
-                            start("purchase", { sku, quantity });
+                            start("purchase", {
+                              sku,
+                              quantity,
+                              applecare,
+                              ...paymentParams,
+                            });
                           }}
                         >
                           <ProductSelect sku={sku} onChange={setSku} />
@@ -598,6 +616,26 @@ export default function App() {
                           <p className="muted">
                             购物袋已有该商品时，数量调整为这里填写的总数。结算前会显示全部商品与金额。
                           </p>
+                          <label className="preorder-consent">
+                            <input
+                              type="checkbox"
+                              checked={applecare}
+                              disabled={busy}
+                              onChange={(e) => setApplecare(e.target.checked)}
+                            />
+                            购买 AppleCare+（AC+）
+                          </label>
+                          <p className="muted">
+                            同时适用于下方定时预购，如设置金额上限，需包含
+                            AC+。不支持或无法确认套餐时会停止下单。
+                          </p>
+                          <PaymentOptions
+                            method={paymentMethod}
+                            term={installmentTerm}
+                            disabled={busy}
+                            onMethod={setPaymentMethod}
+                            onTerm={setInstallmentTerm}
+                          />
                           <div className="button-row">
                             <button
                               className="primary"
@@ -613,6 +651,9 @@ export default function App() {
                       <PreorderForm
                         key={account.id}
                         sku={sku}
+                        applecare={applecare}
+                        paymentMethod={paymentMethod}
+                        installmentTerm={installmentTerm}
                         busy={busy}
                         start={start}
                       />
@@ -638,10 +679,17 @@ export default function App() {
                       ) : (
                         <InlineEmpty text="点击刷新，查看当前账号的购物袋。" />
                       )}
+                      <PaymentOptions
+                        method={paymentMethod}
+                        term={installmentTerm}
+                        disabled={busy}
+                        onMethod={setPaymentMethod}
+                        onTerm={setInstallmentTerm}
+                      />
                       <button
                         className="primary"
                         disabled={busy}
-                        onClick={() => start("checkout")}
+                        onClick={() => start("checkout", paymentParams)}
                       >
                         结算购物袋
                         <ArrowRight size={16} />
@@ -891,6 +939,7 @@ function ItemTable({ items, total }: { items: Data[]; total?: string }) {
                 <td>
                   {item.name || item.sku || item.part}
                   <small>{item.sku || item.part}</small>
+                  {item.applecare && <small>含 AppleCare+（AC+）</small>}
                 </td>
                 <td>{item.quantity}</td>
                 <td className="number">{item.subtotal || "—"}</td>
@@ -1019,6 +1068,7 @@ function Result({
               : "已保存的预购计划"}
         </h3>
         {result.order_number && <p>订单 {result.order_number}</p>}
+        {result.payment_label && <p>付款方式：{result.payment_label}</p>}
         {result.target_at && (
           <p>
             {result.sku} ·{" "}
@@ -1059,7 +1109,9 @@ function Result({
           订单 {result.order_number || "请查询订单确认"}
           {result.amount_due && ` · ${result.amount_due}`}
         </p>
-        {result.qr_data ? (
+        {result.manual_payment ? (
+          <p>{result.message}</p>
+        ) : result.qr_data ? (
           <img
             src={result.qr_data}
             alt={`订单 ${result.order_number || ""} 的支付宝付款二维码`}
@@ -1074,7 +1126,9 @@ function Result({
             </button>
           </>
         )}
-        <p className="muted">请用支付宝扫码。支付完成后查询订单确认状态。</p>
+        {!result.manual_payment && (
+          <p className="muted">请用支付宝扫码。支付完成后查询订单确认状态。</p>
+        )}
         <button className="primary" disabled={disabled} onClick={onOrders}>
           <RefreshCw size={15} />
           我已支付，查询订单
@@ -1170,6 +1224,9 @@ function PromptForm({
           />
           {prompt.details?.store && <p>自提门店：{prompt.details.store}</p>}
           {prompt.details?.address && <p>送货地址：{prompt.details.address}</p>}
+          {prompt.details?.payment_label && (
+            <p>付款方式：{prompt.details.payment_label}</p>
+          )}
         </>
       ) : prompt.kind === "select" ? (
         <SelectField

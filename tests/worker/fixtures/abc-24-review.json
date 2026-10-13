@@ -1,0 +1,14 @@
+{
+  "billingReview": {
+    "installmentReview": {
+      "d": {
+        "labelImageAlt": "中国农业银行",
+        "description": "24 个月，每月约 RMB 534",
+        "installment": true,
+        "sectionHeader": "分期付款方案：",
+        "paymentProviderLabel": "通过支付宝",
+        "appInstructions": "要了解分期付款详情，请查看支付宝 app。"
+      }
+    }
+  }
+}

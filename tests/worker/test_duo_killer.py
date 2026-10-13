@@ -452,7 +452,7 @@ class LoginTests(unittest.TestCase):
         self.assertIn("-20101", str(caught.exception))
 
     def test_auth_credentials_error_explains_config_without_disclosing_response(self):
-        for status, code in ((401, "-20101"), (401, "other"), (400, "-21669")):
+        for status, code in ((401, "-20101"), (401, "-20283"), (401, "other"), (400, "-21669")):
             with self.subTest(status=status, code=code), tempfile.TemporaryDirectory() as temp:
                 path = Path(temp) / "auth.json"
                 client = AppleStoreLogin(auth_path=path)
@@ -464,7 +464,7 @@ class LoginTests(unittest.TestCase):
                 self.assertEqual((error.status, error.codes), (status, (code,)))
                 self.assertNotIn("SECRET", str(error))
                 request.assert_called_once()
-                if code == "-20101":
+                if code in ("-20101", "-20283"):
                     self.assertIn("账号或密码验证失败", str(error))
                     self.assertIn(str(path), str(error))
                     self.assertIn("account 和 password", str(error))
@@ -495,6 +495,10 @@ class BrowserInitializationTests(unittest.TestCase):
                     with self.assertRaises(LoginError) as caught:
                         client.finish_store_login()
                     self.assertEqual(caught.exception.status, status)
+                    if status == 541:
+                        self.assertIn("账号认证已通过", str(caught.exception))
+                        self.assertIn("商城登录回调", str(caught.exception))
+                        self.assertIn("继续登录", str(caught.exception))
                     request.assert_called_once()
                     initialize.assert_not_called()
                 self.assertEqual((client.browser_profile / ".authx-541").exists(), status == 541)
@@ -709,6 +713,7 @@ class FirstRunTests(unittest.TestCase):
 class FailedLoginLifecycleTests(unittest.TestCase):
     def test_failed_auth_clears_session_and_reprompts_only_for_rejected_credentials(self):
         failures = (LoginError("rejected", status=401, codes=("-20101",)),
+                    LoginError("rejected", status=401, codes=("-20283",)),
                     LoginError("bad code", status=400, codes=("-21669",)),
                     LoginError("callback failed", status=541), requests.Timeout("timeout"), EOFError())
         for entry in (None, "https://secure9.www.apple.com.cn/shop/signIn/account?ssi=current"):
@@ -1276,7 +1281,8 @@ class PurchaseFlowTests(unittest.TestCase):
             add.assert_called_once()
             self.assertEqual(add.call_args.kwargs["quantity"], 1)
             self.assertTrue(add.call_args.kwargs["set_total"])
-            pay.assert_called_once_with(flow=add.call_args.kwargs["flow"])
+            pay.assert_called_once_with(flow=add.call_args.kwargs["flow"],
+                                        payment_method='alipay', installment_term=None)
 
     def test_invalid_sku_does_not_start_login(self):
         with patch.object(duo_killer, "ensure_auth_file") as ensure:
@@ -1366,6 +1372,62 @@ class PurchaseFlowTests(unittest.TestCase):
             self.assertTrue(path.read_bytes().startswith(b'\x89PNG\r\n\x1a\n'))
             if os.name != 'nt':  # Windows uses inherited per-user ACLs, not POSIX mode bits.
                 self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+
+class PaymentResultTests(unittest.TestCase):
+    def flow(self, module='thankYouInterstitial', **fields):
+        flow = duo_killer.Checkout(None)
+        flow.url = 'https://secure7.www.apple.com.cn/shop/checkout/interstitial'
+        flow.model = {module: {'d': {'orderNumber': 'W1234567890', 'isPost': False,
+                                   'externalUrl': 'https://openapi.alipay.com/gateway.do?' + duo_killer.urlencode({
+                                       'biz_content': json.dumps({'total_amount': '69.00'}),
+                                       'method': 'alipay.trade.page.pay', 'sign': 'test-only'}), **fields}}}
+        return flow
+
+    def test_interstitial_without_amount_due_uses_payment_link_amount(self):
+        for module in ('thankYouInterstitial', 'externalPayAuth'):
+            with self.subTest(module=module):
+                flow = self.flow(module)
+                with patch.object(flow, 'action', side_effect=AssertionError('不能再次提交订单')):
+                    result = duo_killer.finish_payment(flow)
+                self.assertEqual(result['status'], 'pending_payment')
+                self.assertEqual(result['order_number'], 'W1234567890')
+                self.assertEqual(result['amount_due'], '69.00')
+                self.assertEqual(result['payment_url'], flow.model[module]['d']['externalUrl'])
+
+    def test_existing_amount_due_remains_supported(self):
+        result = duo_killer.payment_result(self.flow(amountDue='RMB 69.00'))
+        self.assertEqual(result['amount_due'], 'RMB 69.00')
+
+    def test_invalid_payment_amount_never_claims_order_was_not_submitted(self):
+        cases = ['not-json', '[]', '{}', json.dumps({'total_amount': True}),
+                 json.dumps({'total_amount': 'unknown'}), json.dumps({'total_amount': '-1'}),
+                 json.dumps({'total_amount': '1.234'}), json.dumps({'total_amount': {'value': '69.00'}})]
+        for content in cases:
+            with self.subTest(content=content):
+                flow = self.flow(externalUrl='https://openapi.alipay.com/gateway.do?' +
+                                 duo_killer.urlencode({'biz_content': content}))
+                with self.assertRaises(ValueError) as error:
+                    duo_killer.payment_result(flow)
+                self.assertIn('下单结果', str(error.exception))
+                self.assertIn('不要重复下单', str(error.exception))
+                self.assertNotIn('未提交订单', str(error.exception))
+
+    def test_missing_or_ambiguous_payment_amount_stops(self):
+        content = json.dumps({'total_amount': '69.00'})
+        for query in ('test=1', duo_killer.urlencode([('biz_content', content), ('biz_content', content)])):
+            with self.subTest(query=query), self.assertRaisesRegex(ValueError, '下单结果'):
+                duo_killer.payment_result(self.flow(externalUrl='https://openapi.alipay.com/gateway.do?' + query))
+
+    def test_invalid_explicit_amount_is_not_hidden_by_link_fallback(self):
+        with self.assertRaisesRegex(ValueError, '下单结果'):
+            duo_killer.payment_result(self.flow(amountDue='unknown'))
+
+    def test_payment_link_fallback_does_not_bypass_url_or_order_checks(self):
+        for fields in ({'orderNumber': ''}, {'isPost': True},
+                       {'externalUrl': 'https://example.invalid/gateway.do?biz_content=%7B%22total_amount%22%3A%2269.00%22%7D'}):
+            with self.subTest(fields=fields), self.assertRaises(ValueError):
+                duo_killer.payment_result(self.flow(**fields))
 
 
 class OrderListTests(unittest.TestCase):

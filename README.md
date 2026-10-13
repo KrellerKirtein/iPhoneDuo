@@ -45,6 +45,27 @@ Web 版不是在线网站。首次登录获取浏览器上下文时，需要安�
 
 ## 快速启动（Web）
 
+**Windows 一键启动：**双击根目录的 `start-web.cmd`，或在 PowerShell 中运行：
+
+```powershell
+cd K:\Code\DuoCreater\iPhoneDuo
+powershell -NoProfile -ExecutionPolicy Bypass -File .\start-web.ps1
+```
+
+该入口会自动使用仓库本地或已安装的 Rust 工具链，缺少前端依赖时按锁文件安装，
+然后启动 Vite 前端、Rust 本地 API 和按任务运行的 Python worker，并打开默认浏览器。
+已有服务运行时复用同一数据目录的服务。首次需要联网准备依赖与编译；按 **Ctrl+C** 一起退出前后端。
+仅关闭浏览器不会停止服务。环境变量只在本次启动中生效，不修改系统 PATH。
+
+需要指定端口、数据目录或不打开浏览器时：
+
+```powershell
+.\start-web.ps1 -Port 1430 -DataDir 'K:\Code\DuoCreater\local-data' -NoOpen
+```
+
+不指定数据目录时沿用 `%APPDATA%\com.niulai.local-web-dev`，保留已有账号配置。
+`run.ps1` 仍用于启动 Tauri 桌面开发版。
+
 **使用源码：**准备 Node.js 22.22+、pnpm 11.9、Rust stable、Python 3.10+（建议 3.12）。macOS 需 Xcode Command Line Tools，Windows 需 MSVC C++ Build Tools。具体安装见 [Tauri 前置要求](https://v2.tauri.app/zh-cn/start/prerequisites/)。
 
 克隆仓库后启动：

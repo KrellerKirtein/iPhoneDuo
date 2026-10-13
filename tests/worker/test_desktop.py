@@ -98,6 +98,46 @@ class ServiceTests(unittest.TestCase):
         self.assertTrue(any(str(p).endswith('msedge.exe') for p in win))
         self.assertTrue(any(str(p).endswith('Google Chrome') for p in browser_candidates('darwin')))
 
+    def test_rejected_password_is_requested_again_after_20283(self):
+        from apple_login import LoginError
+        from unittest.mock import Mock
+        for wrapped in (False, True):
+            with self.subTest(wrapped=wrapped), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                vault = Mock()
+                vault.get.return_value = 'old-password'
+                vault.delete.side_effect = lambda _: setattr(vault.get, 'return_value', None)
+                channel = Mock(account_id='a')
+                channel.prompt.return_value = {'password': 'new-password', 'remember': False}
+                service = Service(channel, root, root, 'a@example.test', vault)
+                service.action = 'enroll'
+                service.ensure_auth_file()
+                self.assertEqual(service.credentials(service.auth)[1], 'old-password')
+                error = LoginError('rejected', status=401, codes=('-20283',))
+                if wrapped:
+                    cause = error
+                    error = ValueError('authentication failed')
+                    error.__cause__ = cause
+                service.cleanup_credentials(error)
+                vault.delete.assert_called_once_with('a')
+                self.assertEqual(json.loads(service.auth.read_text())['account'], 'a@example.test')
+                retry = Service(channel, root, root, 'a@example.test', vault)
+                self.assertEqual(retry.credentials(retry.auth)[1], 'new-password')
+                channel.prompt.assert_called_once()
+
+    def test_other_auth_errors_preserve_saved_password(self):
+        from apple_login import LoginError
+        from unittest.mock import Mock
+        for status, code in ((401, 'other'), (400, '-20283'), (429, '-20283')):
+            with self.subTest(status=status, code=code), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                vault = Mock()
+                service = Service(Channel('a', 't', io.StringIO()), root, root, 'a@example.test', vault)
+                service.action = 'enroll'
+                service.ensure_auth_file()
+                service.cleanup_credentials(LoginError('rejected', status=status, codes=(code,)))
+                vault.delete.assert_not_called()
+
     def test_confirmation_requires_a_true_boolean(self):
         from unittest.mock import Mock
         channel=Mock();channel.prompt.return_value=''

@@ -1,13 +1,21 @@
 import { useEffect, useState } from "react";
 import type { Action, Data } from "./types";
+import { StoreLookup } from "./StoreLookup";
+import { paymentLabels, type PaymentMethod } from "./PaymentOptions";
 
 /** 将用户预先授权的购买范围传给账号独占任务，时间固定按北京时间解释。 */
 export function PreorderForm({
   sku,
+  applecare,
+  paymentMethod,
+  installmentTerm,
   busy,
   start,
 }: {
   sku: string;
+  applecare: boolean;
+  paymentMethod: PaymentMethod;
+  installmentTerm: number;
   busy: boolean;
   start: (action: Action, params?: Data) => Promise<void>;
 }) {
@@ -18,7 +26,10 @@ export function PreorderForm({
   const [authorized, setAuthorized] = useState(false);
   const [windowMinutes, setWindowMinutes] = useState(5);
   const [error, setError] = useState("");
-  useEffect(() => setAuthorized(false), [sku]);
+  useEffect(
+    () => setAuthorized(false),
+    [sku, applecare, paymentMethod, installmentTerm],
+  );
 
   return (
     <section className="section">
@@ -30,6 +41,8 @@ export function PreorderForm({
         购买上方 SKU 的 1
         件商品。先在“本地配置”为当前账号保存完整联系人和送货地址。
         程序会提前检查登录；等待期间请保持应用运行、电脑联网且不休眠。
+        付款方式：{paymentLabels[paymentMethod]}
+        {paymentMethod !== "alipay" && `，${installmentTerm} 期`}。
       </p>
       <form
         onSubmit={(event) => {
@@ -39,9 +52,17 @@ export function PreorderForm({
             setError("请填写 R 开头的门店编号，用逗号分隔。");
             return;
           }
+          if (pickupStores.length > 10) {
+            setError("备选门店最多填写 10 家。");
+            return;
+          }
           setError("");
           void start("preorder", {
             sku,
+            applecare,
+            payment_method: paymentMethod,
+            installment_term:
+              paymentMethod === "alipay" ? null : installmentTerm,
             quantity: 1,
             target_at: `${target}:00+08:00`,
             max_total: maximum,
@@ -71,7 +92,7 @@ export function PreorderForm({
               type="number"
               min="0.01"
               step="0.01"
-              required
+              placeholder="留空则不设上限"
               value={maximum}
               onChange={(event) => {
                 setMaximum(event.target.value);
@@ -93,17 +114,27 @@ export function PreorderForm({
               }}
             />
           </label>
-          <label>
-            备选门店编号（按优先顺序，可留空）
-            <input
+          <div>
+            <label>
+              备选门店编号（按优先顺序，可留空）
+              <input
+                value={stores}
+                placeholder="R390, R401"
+                onChange={(event) => {
+                  setStores(event.target.value.toUpperCase());
+                  setAuthorized(false);
+                }}
+              />
+            </label>
+            <StoreLookup
               value={stores}
-              placeholder="R390, R401"
-              onChange={(event) => {
-                setStores(event.target.value.toUpperCase());
+              onChange={(value) => {
+                setStores(value);
                 setAuthorized(false);
+                setError("");
               }}
             />
-          </label>
+          </div>
           {stores.trim() && (
             <label>
               取货人证件后四位
@@ -133,7 +164,9 @@ export function PreorderForm({
             checked={authorized}
             onChange={(event) => setAuthorized(event.target.checked)}
           />
-          我授权按以上商品、地址和金额上限自动创建一笔订单，付款由我完成
+          {maximum.trim()
+            ? "我授权按以上商品、地址和金额上限自动创建一笔订单，付款由我完成"
+            : "我授权按以上商品和地址自动创建一笔订单，不设金额上限，付款由我完成"}
         </label>
         {error && <p role="alert">{error}</p>}
         <div className="button-row">

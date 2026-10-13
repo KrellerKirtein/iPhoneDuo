@@ -159,6 +159,7 @@ def configure_address(path, auth_path=None):
 
 
 def region_data(flow, path, wanted=None, *, prefer_current=False):
+    """按官网地区模型匹配地址，兼容已有城市但省略城市候选列表的响应。"""
     wanted = wanted or {}
     if prefer_current:
         current = flow.require(path)['d']
@@ -169,6 +170,10 @@ def region_data(flow, path, wanted=None, *, prefer_current=False):
         node = flow.require(path)
         data = node['d']
         options = [(o['value'], o.get('label', o['value'])) for o in data.get(key + 'Options', []) if o.get('value')]
+        if (key == 'city' and not options and data.get('city')
+                and data.get('state') == selected.get('state')):
+            # 上海等地区可只返回已选城市；仅沿用当前省份下官网确认的值。
+            options = [(data['city'], data['city'])]
         desired = wanted.get(key) or data.get(key)
         matches = list(dict.fromkeys(k for k, title in options if desired in (k, title)))
         if not matches and desired:

@@ -144,7 +144,9 @@ def request_get(session, stage, url, method="GET", **kwargs):
                           error_page=title if title in {"Page Not Found - Apple", "Access Denied"}
                           else "其他页面" if title else "无 HTML 标题")
         log.info("[%s] HTTP %s %s", stage, reply.status_code, safe_url(request.url))
-        log.debug("[%s] 请求详情：%s", stage, json.dumps(detail, ensure_ascii=False))
+        # 失败诊断在桌面 INFO 日志中可见；只记录上述白名单，不记录响应正文或 Cookie 值。
+        log.log(logging.WARNING if reply.status_code >= 400 else logging.DEBUG,
+                "[%s] 请求详情：%s", stage, json.dumps(detail, ensure_ascii=False))
     log.info("[%s] 完成，耗时 %.2fs，跳转 %s 次", stage, perf_counter() - started, len(response.history))
     remove_imported_cookie_duplicates(session)
     return response
@@ -630,6 +632,88 @@ def add_to_bag(part=PART, quantity=1, *, set_total=False, flow=None):
                 save_auth(session)
 
 
+def applecare_items(item):
+    """仅识别已附加的 AppleCare 子商品，排除推荐和套餐编辑模型。"""
+    found = []
+    if isinstance(item, dict):
+        data = item.get('d', {})
+        name = order_text(data.get('name') or data.get('productName') or data.get('title'))
+        if data.get('isChildItem') is True and 'applecare' in name.lower().replace(' ', ''):
+            found.append(str(data.get('sku') or data.get('partNumber') or name))
+        for key, value in item.items():
+            if key not in {'d', 'inlineRecommendations', 'changeAppleCare'}:
+                found.extend(applecare_items(value))
+    elif isinstance(item, list):
+        for value in item:
+            found.extend(applecare_items(value))
+    return sorted(found)
+
+
+def configure_applecare(flow, part, selected):
+    """用官网 action 设置目标商品的 AC+，查袋确认后冻结复核所需的附加商品。"""
+    if type(selected) is not bool:
+        raise ValueError('AppleCare 选项必须是勾选状态。')
+    item_id, item = cart_item(flow, part)
+    if item is None:
+        raise ValueError('购物袋没有目标商品，无法设置 AppleCare。')
+    expected_items = model_items(field(flow.model, 'shoppingCart.items', {}))
+    attached = applecare_items(item)
+    if bool(attached) != selected:
+        module = f'shoppingCart.items.{item_id}'
+        if field(item, 'a.changeAppleCareModal.url'):
+            flow.action(module, 'changeAppleCareModal')
+            module += '.changeAppleCare'
+            editor = flow.require(module)
+            choices = []
+            for group in field(editor, 'd.appleCareGroups', []):
+                if 'applecare+' in order_text(group.get('displayName')).lower().replace(' ', ''):
+                    choices.extend(option.get('value') for option in group.get('values', [])
+                                   if option.get('value') and option.get('value') != 'none')
+            if selected and len(set(choices)) != 1:
+                raise ValueError('未提供唯一可选的 AppleCare+ 套餐，请先在官网选择。')
+            if not selected and not any(group.get('value') == 'none'
+                                        for group in field(editor, 'd.appleCareGroups', [])):
+                raise ValueError('官网没有提供取消 AppleCare 的选项，已停止。')
+            flow.action(module, 'updateAppleCareSelection',
+                        {module + '.appleCarePartNumber': choices[0] if selected else 'none'})
+        elif selected:
+            candidates = []
+            for key, node in field(item, 'inlineRecommendations', {}).items():
+                if (isinstance(node, dict) and field(node, 'a.add.url') and
+                        'applecare+' in order_text(field(node, 'd.title')).lower().replace(' ', '')):
+                    candidates.append((key, node))
+            if len(candidates) != 1:
+                raise ValueError('当前商品未提供唯一的 AppleCare+ 加购选项，已停止。')
+            key, node = candidates[0]
+            module += '.inlineRecommendations.' + key
+            options = field(node, 'd.options', [])
+            choices = [option.get('value') for option in options if option.get('value')]
+            if options and len(set(choices)) != 1:
+                raise ValueError('AppleCare+ 有多个或未知套餐，请先在官网选择。')
+            value = choices[0] if choices else field(node, 'd.appleCarePartNumber')
+            flow.action(module, 'add', {module + '.appleCarePartNumber': value} if value else {})
+        else:
+            raise ValueError('无法自动取消已有 AppleCare，请先在官网移除后重试。')
+        flow.page(BASE_URL + '/shop/bag', '核对 AppleCare 选项')
+        _, item = cart_item(flow, part)
+        attached = applecare_items(item)
+        if (item is None or bool(attached) != selected or
+                model_items(field(flow.model, 'shoppingCart.items', {})) != expected_items):
+            raise ValueError('购物袋 AppleCare 状态与选择不一致，已停止，未提交订单。')
+    flow.applecare_selection = (part, attached)
+
+
+def verify_applecare(flow, items):
+    """结账前后核对目标商品附加服务，防止 AC+ 丢失或意外加入后仍提交订单。"""
+    selection = getattr(flow, 'applecare_selection', None)
+    if not isinstance(selection, tuple):
+        return
+    part, expected = selection
+    matches = [item for item in model_item_nodes(items) if field(item, 'd.sku') == part]
+    if len(matches) != 1 or applecare_items(matches[0]) != expected:
+        raise ValueError('订单 AppleCare 与购买选择不一致，已停止，未提交订单。')
+
+
 def _add_one_to_bag(session, part):
     product_url = BASE_URL + "/shop/product/" + part
     session.headers.update({"Accept": "*/*", "Referer": product_url})
@@ -870,7 +954,8 @@ def order_price(value):
     return text
 
 
-def confirm_order(model):
+def confirm_order(model, payment=None):
+    """向用户或定时策略复核全部商品、总额和本次付款方式。"""
     review = field(model, "checkout.review", {})
     rows = []
     for item in model_item_nodes(review.get("fulfillmentReview", {})):
@@ -895,27 +980,70 @@ def confirm_order(model):
     if delivery:
         print("送货地址：" + order_text(delivery))
     print(f"\n总支付：{total}")
+    if payment:
+        from payment_options import description
+        print('付款方式：' + description(payment))
     if interaction.handler is not None:
         details = {"items": [{"name": order_text(field(item, "d.name") or field(item, "d.productName") or field(item, "d.sku")),
                               "sku": field(item, "d.sku"), "quantity": int(field(item, "itemQuantity.d.quantity")),
-                              "subtotal": order_price(field(item, "d.totalPrice"))}
+                              "subtotal": order_price(field(item, "d.totalPrice")),
+                              "applecare": bool(applecare_items(item))}
                              for item in model_item_nodes(review.get("fulfillmentReview", {}))],
                    "total": total, "store": order_text(store), "address": order_text(delivery)}
+        if payment:
+            details.update(payment)
+            details['payment_label'] = description(payment)
         if interaction.handler.confirm(details) is not True:
             raise ValueError("已取消下单，购物袋已保留。")
         return
     try:
-        answer = input("👉 按回车确认创建订单并获取付款二维码")
+        answer = input("👉 按回车确认创建订单" +
+                       ("（随后自行付款）" if payment and payment['payment_method'] != 'alipay' else "并获取付款二维码"))
     except EOFError:
         raise ValueError("确认输入已结束，未提交订单；购物袋已保留。") from None
     if answer != "":
         raise ValueError("已取消下单，购物袋已保留。")
 
 
-def payment_result(flow):
+def payment_amount(header, payment_url):
+    """从下单结果或已校验来源的支付宝链接读取金额，失败时保留已提交语义。"""
+    error = '下单结果缺少可识别的待付金额，请在官网查询已有订单；不要重复下单。'
+    amount = header.get('amountDue')
+    if amount in (None, ''):
+        # thankYouInterstitial 可省略 amountDue，金额位于原始支付链接的业务参数中。
+        contents = [v for k, v in parse_qsl(urlsplit(payment_url).query, keep_blank_values=True)
+                    if k == 'biz_content']
+        if len(contents) != 1:
+            raise ValueError(error)
+        try:
+            business = json.loads(contents[0])
+        except ValueError:
+            raise ValueError(error) from None
+        amount = business.get('total_amount') if isinstance(business, dict) else None
+        if not isinstance(amount, str) or not re.fullmatch(r'[0-9]+(?:\.[0-9]{1,2})?', amount):
+            raise ValueError(error)
+    try:
+        order_price(amount)
+    except ValueError:
+        raise ValueError(error) from None
+    return amount
+
+
+def payment_result(flow, payment=None):
+    """解析已创建订单的付款入口，兼容两种官网结果模型，不重建订单。"""
     # 官网 payment-instructions.js 的“现在支付”绑定此模型。
     module = "externalPayAuth" if "externalPayAuth" in flow.model else "thankYouInterstitial"
     header = field(flow.model, module + ".d", {})
+    if payment and payment['payment_method'] != 'alipay':
+        from payment_options import description
+        if not re.fullmatch(r'W\d{6,}', str(header.get('orderNumber', ''))):
+            raise ValueError('下单结果缺少有效订单号，请查询订单确认；不要重复下单。')
+        # 分期可返回银行 POST 跳转；只读取订单信息，完全忽略外部付款地址与表单。
+        amount = payment_amount(header, '')
+        return {'success': True, 'status': 'pending_payment', 'manual_payment': True,
+                'order_number': header['orderNumber'], 'amount_due': amount, **payment,
+                'message': description(payment) + '。订单已创建，尚未付款；请在 Apple 官网订单页手动完成付款。' +
+                           ('在支付宝中选择农业银行信用卡。' if payment['payment_method'] == 'alipay_abc_installment' else '')}
     url = header.get("externalUrl", "")
     parsed = urlsplit(url)
     if (header.get("isPost") or parsed.scheme != "https" or parsed.hostname != "openapi.alipay.com"
@@ -923,13 +1051,16 @@ def payment_result(flow):
         raise ValueError("下单结果页未提供预期的支付宝 GET 支付链接，请在官网查看订单；不要重复下单。")
     if not re.fullmatch(r'W\d{6,}', str(header.get('orderNumber', ''))):
         raise ValueError('下单结果缺少有效订单号，请查询订单确认；不要重复下单。')
-    order_price(header.get('amountDue'))
+    amount = payment_amount(header, url)
     return {"success": True, "status": "pending_payment", "order_number": header.get("orderNumber"),
-            "amount_due": header.get("amountDue"), "payment_url": url,
+            "amount_due": amount, "payment_url": url,
             "message": "订单已创建，尚未付款；请打开支付链接完成支付宝支付。"}
 
 
 def payment_qr(result):
+    """原有支付宝结果可取二维码，手动分期结果禁止访问支付平台。"""
+    if result.get('manual_payment') or result.get('payment_method') in ('cmb_installment', 'alipay_abc_installment'):
+        raise ValueError('分期订单仅支持在 Apple 官网订单页手动付款，本项目不获取付款二维码。')
     try:
         result.update(get_payment_qr(result["payment_url"]))
     except (OSError, ValueError, requests.RequestException) as error:
@@ -940,10 +1071,11 @@ def payment_qr(result):
         result["qr_error"] = message + " 可用 -purl 重试获取二维码。"
 
 
-def finish_payment(flow):
+def finish_payment(flow, payment=None):
+    """只轮询商城订单处理状态，手动分期返回订单身份后结束。"""
     for attempt in range(12):
         if urlsplit(flow.url).path == "/shop/checkout/interstitial":
-            return payment_result(flow)
+            return payment_result(flow, payment)
         if not field(flow.model, "spinner.a.checkStatus.url"):
             raise ValueError("未取得订单处理状态，请运行 -o 查询订单。")
         if attempt:
@@ -952,7 +1084,10 @@ def finish_payment(flow):
     raise ValueError("订单仍在处理中，请稍后运行 -o 查询订单。")
 
 
-def pay_bag(*, flow=None):
+def pay_bag(*, flow=None, payment_method='alipay', installment_term=None):
+    """按用户付款选择创建订单，分期订单不获取二维码或执行付款。"""
+    from payment_options import validate, select_billing, verify_review
+    payment = validate(payment_method, installment_term)
     standalone = flow is None
     with (requests.Session() if standalone else nullcontext(flow.session)) as session:
         if standalone:
@@ -964,6 +1099,7 @@ def pay_bag(*, flow=None):
             else:
                 log.info("[结账购物袋] 复用加购后的实时购物袋模型和会话，跳过重复 GET。")
             cart = flow.require("shoppingCart")
+            verify_applecare(flow, cart.get('items', {}))
             expected = model_items(cart.get("items", {}))
             if not expected:
                 raise ValueError("购物袋为空，无法下单。")
@@ -985,32 +1121,27 @@ def pay_bag(*, flow=None):
             reauthenticate_checkout(flow)
             checkout_delivery(flow)
             checkout_shipping(flow)
-            billing = "checkout.billing.billingOptions"
-            options = flow.require(billing)["d"].get("options", [])
-            if not any(o.get("value") == "ALIPAY" for o in options):
-                raise ValueError("当前订单不支持支付宝。")
-            data = {billing + ".selectBillingOption": "ALIPAY", billing + ".bankLookUp.selectBank": ""}
-            flow.action(billing, "selectBillingOptionAction", {**data, "checkout.locationConsent.locationConsent": "false"})
-            flow.action("checkout.billing", "continueFromBillingToReview", data)
+            select_billing(flow, payment)
             review = flow.require("checkout.review")
             if (field(review, "placeOrder.d.enableContinue") is not True or
-                    field(review, "billingReview.alipayReview.d.alipayLabel") != "ALIPAY" or
                     model_items(review.get("fulfillmentReview", {})) != expected):
                 raise ValueError("订单复核未通过：商品、数量、支付方式或下单状态不符合预期。")
-            confirm_order(flow.model)
+            verify_review(review, payment)
+            verify_applecare(flow, review.get('fulfillmentReview', {}))
+            confirm_order(flow.model, payment)
             save_auth(session)
             policy = getattr(flow, 'policy', None)
             if policy:
                 policy.before_submit()
             interaction.report_stage("正在提交订单", order_submitted=True)
             flow.action("checkout.review.placeOrder", "continueFromReviewToProcess")
-            result = finish_payment(flow)
+            result = finish_payment(flow, payment)
             if policy:
                 policy.validate_result(result)
             if PAYMENT_ROOT is not None:
                 # Keep the issued payment link even if fetching its QR image is interrupted.
                 write_private_json(PAYMENT_ROOT / "payment.json", result)
-            if not policy:
+            if not policy and payment_method == 'alipay':
                 payment_qr(result)
             write_private_json((PAYMENT_ROOT or ROOT) / "payment.json", result)
             return result
@@ -1019,8 +1150,13 @@ def pay_bag(*, flow=None):
                 save_auth(session)
 
 
-def purchase_sku(part, sms=False, quantity=1):
+def purchase_sku(part, sms=False, quantity=1, *, applecare=None, payment_method='alipay', installment_term=None):
+    """按目标数量购买；界面传入明确 AC+ 选择，旧命令行调用保留购物袋配置。"""
     part = normalize_sku(part)
+    from payment_options import validate
+    payment = validate(payment_method, installment_term)
+    if applecare is not None and type(applecare) is not bool:
+        raise ValueError('AppleCare 选项必须是勾选状态。')
     if type(quantity) is not int or quantity < 1:
         raise ValueError("加购数量必须是正整数。")
     ensure_auth_file()
@@ -1047,7 +1183,9 @@ def purchase_sku(part, sms=False, quantity=1):
                 print("商城已登录。")
             print(f"目标购买数量：{part} × {quantity}")
             add_to_bag(part, quantity=quantity, set_total=True, flow=flow)
-            return pay_bag(flow=flow)
+            if applecare is not None:
+                configure_applecare(flow, part, applecare)
+            return pay_bag(flow=flow, **payment)
         finally:
             save_auth(session)
 

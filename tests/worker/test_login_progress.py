@@ -70,6 +70,28 @@ class LoginProgressTests(unittest.TestCase):
         self.assertIn('HTTP 200', '\n'.join(captured.output))
         self.assertNotIn('secret-token', '\n'.join(captured.output))
 
+    def test_failed_callback_diagnostics_are_visible_without_secrets(self):
+        url = 'https://secure6.www.apple.com.cn/shop/signIn/idms/authx?ssi=secret-token'
+        response = requests.Response()
+        response.status_code = 541
+        response.url = url
+        response._content = b'<title>secret-account</title>secret-body'
+        response.headers.update({'Content-Type': 'text/html', 'Set-Cookie': 'secret-cookie'})
+        response.raw = HTTPResponse(headers={})
+        response.request = requests.Request('POST', url, headers={
+            'Cookie': 'shld_bt_ck=secret-cookie', 'Authorization': 'secret-authorization',
+            'Referer': 'https://secure6.www.apple.com.cn/shop/signIn?ssi=secret-referrer',
+        }).prepare()
+        with requests.Session() as session, patch.object(session, 'request', return_value=response), \
+                patch.object(duo_killer.log, 'disabled', False), \
+                self.assertLogs('duo_killer', level='INFO') as captured:
+            duo_killer.request_get(session, '登录商城', url, method='POST')
+        output = '\n'.join(captured.output)
+        self.assertIn('请求详情', output)
+        self.assertIn('body_sha256', output)
+        self.assertIn('shld_bt_ck', output)
+        self.assertNotIn('secret-', output)
+
 
 if __name__ == '__main__':
     unittest.main()

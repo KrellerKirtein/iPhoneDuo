@@ -126,6 +126,8 @@ class Service:
                 self.stage('操作成功，但系统未保存密码；下次登录需重新输入')
 
     def cleanup_credentials(self, error=None):
+        """清理任务中的密码；凭据被拒绝时失效保险库缓存，允许下次重新输入。"""
+        from apple_login import is_credentials_error
         if self.should_remove_account(error):
             try:
                 self.vault.delete(self.channel.account_id)
@@ -133,7 +135,7 @@ class Service:
                 self.auth.unlink(missing_ok=True)
                 self.password = None
             return
-        if error and '-20101' in str(error):
+        if is_credentials_error(error) or error and '-20101' in str(error):
             try:
                 self.vault.delete(self.channel.account_id)
             except Exception:
@@ -212,6 +214,10 @@ class Service:
         if action in ('purchase', 'checkout', 'add'):
             from preorder import guard_manual_purchase
             guard_manual_purchase(self.root)
+        payment = {}
+        if action in ('purchase', 'checkout'):
+            from payment_options import validate
+            payment = validate(params.get('payment_method', 'alipay'), params.get('installment_term'))
         if action == 'address_read':
             return {'success': True, 'config': checkout_options.read_config(self.checkout)}
         if action == 'address_save':
@@ -235,11 +241,12 @@ class Service:
         elif action == 'login':
             result = duo_killer.login(sms=params.get('sms') is True)
         elif action == 'purchase':
-            result = duo_killer.purchase_sku(params.get('sku', 'MK2U4CH'), quantity=quantity(params))
+            result = duo_killer.purchase_sku(params.get('sku', 'MK2U4CH'), quantity=quantity(params),
+                                            applecare=params.get('applecare', False), **payment)
         elif action == 'add':
             result = duo_killer.add_to_bag(params.get('sku', ''), quantity=quantity(params), set_total=True)
         elif action == 'checkout':
-            result = duo_killer.pay_bag()
+            result = duo_killer.pay_bag(**payment)
         elif action == 'qr':
             source_id = str(params.get('source_task', ''))
             import uuid

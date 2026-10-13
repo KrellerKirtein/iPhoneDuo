@@ -1,4 +1,4 @@
-// User-provided presets. Prices are reference values, never checkout quotes.
+// Product presets. Prices are reference values, never checkout quotes.
 export const duoProducts = [
   { sku: "MK2Q4CH", name: "iPhone Duo 512GB Night Sky", price: 17999 },
   { sku: "MK2W4CH", name: "iPhone Duo 2TB Night Sky", price: 26499 },
@@ -11,6 +11,8 @@ export const duoProducts = [
 ];
 export const presetProducts = [
   ...duoProducts,
+  // Apple CN catalog verified on 2026-10-13; checkout normalizes the /A suffix.
+  { sku: "MJY64CH", name: "iPhone 18 Pro Max 256GB 黑色", price: 10999 },
   { sku: "MLH74FE", name: "抛光布", price: 69 },
 ];
 export const priceText = (value: unknown) =>

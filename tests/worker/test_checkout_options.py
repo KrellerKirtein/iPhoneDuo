@@ -275,6 +275,81 @@ class CheckoutOptionsTests(unittest.TestCase):
         self.assertEqual(flow.calls[0][2]['region.district'], '')
         self.assertEqual([n for _, n, _ in flow.calls], ['Selectstate', 'Selectcity', 'Selectdistrict'])
 
+    def test_home_delivery_accepts_server_city_without_city_options(self):
+        # 官网上海配送模型带有已选城市和区县列表，但省略 cityOptions。
+        for city_options in (None, []):
+            with self.subTest(city_options=city_options):
+                flow = FakeFlow(fulfillment_model())
+                path = 'checkout.fulfillment.deliveryTab.delivery.deliveryLocation.address.provinceCityDistrictTabsForCheckout'
+                data = flow.require(path)['d']
+                data.update(state='上海', city='上海', district='浦东新区',
+                            districtOptions=[{'value': '浦东新区', 'label': '浦东新区'}])
+                data.pop('cityOptions')
+                if city_options is not None:
+                    data['cityOptions'] = city_options
+                with patch('builtins.input', return_value='') as prompt:
+                    options.fulfillment(flow, self.path)
+                prompt.assert_called_once()  # 只选择收货方式。
+                self.assertEqual([name for _, name, _ in flow.calls], ['continueFromFulfillmentToShipping'])
+                self.assertEqual(flow.calls[-1][2][path + '.city'], '上海')
+                self.assertEqual(flow.calls[-1][2][path + '.district'], '浦东新区')
+
+    def test_quick_address_accepts_server_city_without_city_options(self):
+        config = deepcopy(CONFIG)
+        config['delivery'] = {'state': '上海市', 'city': '上海市', 'district': '浦东新区'}
+        options.save_config(self.path, config)
+        flow = FakeFlow(shipping_model())
+        path = 'checkout.shipping.addressSelector.newAddress.address.stateCitySelectorForCheckout'
+        data = flow.require(path)['d']
+        data.update(state='上海', city='上海', district='浦东新区',
+                    districtOptions=[{'value': '浦东新区', 'label': '浦东新区'}])
+        data.pop('cityOptions')
+        with patch('builtins.input', return_value='2') as prompt:
+            options.shipping(flow, self.path)
+        prompt.assert_called_once()  # 只选择本地快捷地址。
+        self.assertEqual(flow.calls[-1][2][path + '.city'], '上海')
+        self.assertEqual(flow.model['checkout']['d']['page'], 'Billing')
+
+    def test_region_change_accepts_city_confirmed_by_state_response(self):
+        flow = FakeFlow({'region': deepcopy(REGION)})
+        original_action = flow.action
+
+        def action(module, name, data=None):
+            original_action(module, name, data)
+            if name == 'Selectstate':
+                region = flow.require(module)['d']
+                region.update(city='上海', district='',
+                              districtOptions=[{'value': '浦东新区', 'label': '浦东新区'}])
+                region.pop('cityOptions')
+
+        flow.action = action
+        with patch('builtins.input', side_effect=AssertionError('官网确认城市后不应询问')):
+            data = options.region_data(flow, 'region', {'state': '上海', 'city': '上海', 'district': '浦东新区'})
+        self.assertEqual(data['region.city'], '上海')
+        self.assertEqual([name for _, name, _ in flow.calls], ['Selectstate', 'Selectdistrict'])
+
+    def test_missing_city_options_never_invents_city_from_local_config(self):
+        flow = FakeFlow({'region': deepcopy(REGION)})
+        flow.require('region')['d'].update(city='', cityOptions=[])
+        with self.assertRaisesRegex(ValueError, '城市：没有可选项'):
+            options.region_data(flow, 'region', CONFIG['delivery'])
+        self.assertEqual(flow.calls, [])
+
+    def test_missing_city_options_does_not_silently_override_wanted_city(self):
+        flow = FakeFlow({'region': deepcopy(REGION)})
+        flow.require('region')['d'].pop('cityOptions')
+        with patch('builtins.input', side_effect=EOFError) as prompt, self.assertRaises(EOFError):
+            options.region_data(flow, 'region', {**CONFIG['delivery'], 'city': '绵阳'})
+        prompt.assert_called_once()
+        self.assertEqual(flow.calls, [])
+
+    def test_missing_city_options_never_reuses_city_from_unconfirmed_state(self):
+        flow = FakeFlow({'region': deepcopy(REGION)})
+        flow.require('region')['d'].pop('cityOptions')
+        flow.action = lambda *args: None  # 切省未成功，仍保留旧省份和旧城市。
+        with self.assertRaisesRegex(ValueError, '城市：没有可选项'):
+            options.region_data(flow, 'region', {'state': '上海', 'city': '成都', 'district': '锦江区'})
+
     def test_county_label_uniquely_matches_api_district_without_prompt(self):
         flow = FakeFlow({'region': deepcopy(REGION)})
         flow.model['region']['d'].update(district='双流区', districtOptions=[{'value': '双流区', 'label': '双流区'}])

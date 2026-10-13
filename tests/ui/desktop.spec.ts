@@ -101,7 +101,12 @@ async function fixture(
             logs: [],
           };
           tasks.unshift(task);
-          root.started.push({ accountId, action, id });
+          root.started.push({
+            accountId,
+            action,
+            id,
+            params: structuredClone(params),
+          });
           if (action === "preorder") root.plans.push(structuredClone(params));
           if (
             action === "login" ||
@@ -292,6 +297,116 @@ async function enterWorkspace(page: Page) {
   await page.getByRole("button", { name: "检查并使用所选账号" }).click();
   await expect(page.getByRole("button", { name: "立即下单" })).toBeVisible();
 }
+
+test("store lookup searches locally and appends stores in priority order", async ({
+  page,
+}) => {
+  await fixture(page);
+  await page.goto("/");
+  await enterWorkspace(page);
+  const stores = page.getByLabel("备选门店编号");
+  const consent = page.getByRole("checkbox", { name: /我授权/ });
+  await page.getByLabel("订单总额上限（人民币元）").fill("22000");
+  await consent.check();
+  await page.getByRole("button", { name: "查询门店编号", exact: true }).click();
+  const search = page.getByRole("searchbox", {
+    name: "搜索门店（城市、店名或编号）",
+  });
+  await search.fill("上海 香港广场");
+  await expect(
+    page.getByRole("list", { name: "门店查询结果" }).getByRole("listitem"),
+  ).toHaveCount(1);
+  await expect(
+    page.getByText("上海市黄浦区淮海中路 282 号，香港广场北座", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await search.press("Enter");
+  expect(await page.evaluate(() => (window as any).plans)).toHaveLength(0);
+  await page
+    .getByRole("button", { name: "添加 香港广场 R390", exact: true })
+    .click();
+  await expect(stores).toHaveValue("R390");
+  await expect(consent).not.toBeChecked();
+  await expect(
+    page.getByRole("button", { name: "已添加 香港广场 R390" }),
+  ).toBeDisabled();
+  await expect(page.getByLabel("取货人证件后四位")).toBeVisible();
+  await search.fill("r401");
+  await page
+    .getByRole("button", { name: "添加 上海环贸 iapm R401", exact: true })
+    .click();
+  await expect(stores).toHaveValue("R390, R401");
+  await search.fill("不存在的门店");
+  await expect(page.getByText(/未找到匹配门店/)).toBeVisible();
+  await page.getByRole("button", { name: "收起门店查询" }).click();
+  await expect(search).toHaveCount(0);
+  await expect(stores).toHaveValue("R390, R401");
+  await page.getByLabel("取货人证件后四位").fill("123X");
+  await consent.check();
+  await page.getByRole("button", { name: "启用定时预购" }).click();
+  expect(
+    await page.evaluate(() => (window as any).plans[0].pickup_stores),
+  ).toEqual(["R390", "R401"]);
+});
+
+test("store lookup respects the store limit and fits a narrow viewport", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await fixture(page);
+  await page.goto("/");
+  await enterWorkspace(page);
+  const stores = page.getByLabel("备选门店编号");
+  await stores.fill("R390，R401 R389 R359 R705 R683 R581 R678 R320 R388");
+  await page.getByRole("button", { name: "查询门店编号", exact: true }).click();
+  await page.getByRole("searchbox").fill("成都");
+  await expect(page.getByText(/已达 10 家上限/)).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "添加 成都太古里 R580", exact: true }),
+  ).toBeDisabled();
+  await stores.fill("R390，R401");
+  await expect(
+    page.getByRole("button", { name: "添加 成都太古里 R580", exact: true }),
+  ).toBeEnabled();
+  await page
+    .getByRole("button", { name: "添加 成都太古里 R580", exact: true })
+    .click();
+  await expect(stores).toHaveValue("R390, R401, R580");
+  const panel = page.locator(".store-lookup-panel");
+  await panel.scrollIntoViewIfNeeded();
+  const bounds = await panel.boundingBox();
+  expect(bounds).not.toBeNull();
+  expect(bounds!.x).toBeGreaterThanOrEqual(0);
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(390);
+  expect(
+    await panel.evaluate(
+      (element) => element.scrollWidth <= element.clientWidth,
+    ),
+  ).toBe(true);
+  await page.screenshot({ path: "artifacts/store-lookup-mobile.png" });
+});
+
+test("scheduled purchase accepts a cleared limit and revokes prior consent", async ({
+  page,
+}) => {
+  await fixture(page);
+  await page.goto("/");
+  await enterWorkspace(page);
+  const maximum = page.getByLabel("订单总额上限（人民币元）");
+  const consent = page.getByRole("checkbox", { name: /我授权/ });
+  await expect(maximum).toHaveAttribute("placeholder", "留空则不设上限");
+  await maximum.fill("22000");
+  await consent.check();
+  await maximum.fill("");
+  await expect(consent).not.toBeChecked();
+  await expect(consent).toHaveAccessibleName(/不设金额上限/);
+  await consent.check();
+  await page.getByRole("button", { name: "启用定时预购" }).click();
+  const plans = await page.evaluate(() => (window as any).plans);
+  expect(plans).toHaveLength(1);
+  expect(plans[0]).toMatchObject({ max_total: "", authorized: true });
+});
 
 test("scheduled purchase freezes Beijing time and stops at pending payment", async ({
   page,
@@ -544,6 +659,175 @@ test("desktop workspace screenshot", async ({ page }) => {
     fullPage: true,
     animations: "disabled",
   });
+});
+
+test("real iPhone preset and installment choice reach purchase without offering payment QR", async ({
+  page,
+}) => {
+  await fixture(page);
+  await page.goto("/");
+  await enterWorkspace(page);
+  await page.getByRole("combobox", { name: "预制商品" }).click();
+  await page
+    .getByRole("option", { name: /iPhone 18 Pro Max 256GB 黑色/ })
+    .click();
+  await expect(page.getByLabel("商品 SKU")).toHaveValue("MJY64CH");
+  await page.getByRole("combobox", { name: "付款方式" }).click();
+  await page
+    .getByRole("option", { name: "招商银行分期（手动付款）", exact: true })
+    .click();
+  await page.getByRole("combobox", { name: "分期期数" }).click();
+  await page.getByRole("option", { name: "12 期", exact: true }).click();
+  await page
+    .locator(".section")
+    .filter({
+      has: page.getByRole("heading", { name: "购买商品", exact: true }),
+    })
+    .screenshot({
+      path: "artifacts/ui-installment-purchase.png",
+      animations: "disabled",
+    });
+  await page.getByRole("button", { name: "立即下单" }).click();
+  expect(
+    await page.evaluate(
+      () =>
+        (window as any).started.find((t: any) => t.action === "purchase")
+          .params,
+    ),
+  ).toMatchObject({
+    sku: "MJY64CH",
+    payment_method: "cmb_installment",
+    installment_term: 12,
+  });
+  await page.evaluate(() => {
+    const root = window as any;
+    const task = root.started.find((t: any) => t.action === "purchase");
+    root.finish(task.id, {
+      status: "succeeded",
+      prompt: null,
+      order_submitted: true,
+      result: {
+        success: true,
+        status: "pending_payment",
+        manual_payment: true,
+        payment_method: "cmb_installment",
+        installment_term: 12,
+        order_number: "W123456789",
+        amount_due: "RMB 10000",
+        message:
+          "招商银行分期 · 12 期 · 手动付款。请在 Apple 官网订单页手动完成付款。",
+        qr_data: "data:image/png;base64,ignored",
+      },
+    });
+  });
+  await expect(
+    page.getByRole("heading", { name: "订单已创建，等待付款" }),
+  ).toBeVisible();
+  await expect(
+    page.getByText(/请在 Apple 官网订单页手动完成付款/),
+  ).toBeVisible();
+  await expect(page.getByRole("button", { name: "获取二维码" })).toHaveCount(0);
+  await expect(page.getByRole("img", { name: /付款二维码/ })).toHaveCount(0);
+  await page.getByRole("button", { name: /备用账号 seco/ }).click();
+  await expect(page.getByRole("combobox", { name: "付款方式" })).toHaveText(
+    "支付宝（原有方式）",
+  );
+});
+
+test("installment changes revoke scheduled consent and freeze the new selection", async ({
+  page,
+}) => {
+  await fixture(page);
+  await page.goto("/");
+  await enterWorkspace(page);
+  await page.getByLabel("订单总额上限（人民币元）").fill("25000");
+  const consent = page.getByRole("checkbox", { name: /我授权/ });
+  await consent.check();
+  await page.getByRole("combobox", { name: "付款方式" }).click();
+  await page
+    .getByRole("option", {
+      name: "支付宝·农业银行分期（手动付款）",
+      exact: true,
+    })
+    .click();
+  await expect(consent).not.toBeChecked();
+  await consent.check();
+  await page.getByRole("combobox", { name: "分期期数" }).click();
+  await page.getByRole("option", { name: "6 期", exact: true }).click();
+  await expect(consent).not.toBeChecked();
+  await consent.check();
+  await page.getByRole("button", { name: "启用定时预购" }).click();
+  expect(await page.evaluate(() => (window as any).plans[0])).toMatchObject({
+    payment_method: "alipay_abc_installment",
+    installment_term: 6,
+  });
+});
+
+test("bag checkout carries the selected installment method", async ({
+  page,
+}) => {
+  await fixture(page);
+  await page.goto("/");
+  await enterWorkspace(page);
+  await page.getByRole("button", { name: "购物袋", exact: true }).click();
+  await page.getByRole("combobox", { name: "付款方式" }).click();
+  await page
+    .getByRole("option", { name: "招商银行分期（手动付款）", exact: true })
+    .click();
+  await page.getByRole("button", { name: "结算购物袋", exact: true }).click();
+  expect(
+    await page.evaluate(
+      () =>
+        (window as any).started.find((t: any) => t.action === "checkout")
+          .params,
+    ),
+  ).toEqual({ payment_method: "cmb_installment", installment_term: 24 });
+});
+
+test("AppleCare selection reaches purchase and resets for other products and accounts", async ({
+  page,
+}) => {
+  await fixture(page);
+  await page.goto("/");
+  await enterWorkspace(page);
+  const care = page.getByRole("checkbox", { name: "购买 AppleCare+（AC+）" });
+  await expect(care).not.toBeChecked();
+  await care.check();
+  await page.getByLabel("商品 SKU").fill("MLH74FE");
+  await expect(care).not.toBeChecked();
+  await care.check();
+  await page.getByRole("button", { name: /备用账号 seco/ }).click();
+  await expect(care).not.toBeChecked();
+  await care.check();
+  await page.getByRole("button", { name: "立即下单" }).click();
+  expect(
+    await page.evaluate(
+      () =>
+        (window as any).started.find((t: any) => t.action === "purchase").params
+          .applecare,
+    ),
+  ).toBe(true);
+});
+
+test("AppleCare changes revoke scheduled consent and are frozen in the plan", async ({
+  page,
+}) => {
+  await fixture(page);
+  await page.goto("/");
+  await enterWorkspace(page);
+  await page.getByLabel("订单总额上限（人民币元）").fill("23000");
+  const consent = page.getByRole("checkbox", { name: /我授权/ });
+  await consent.check();
+  await page.getByRole("checkbox", { name: "购买 AppleCare+（AC+）" }).check();
+  await expect(consent).not.toBeChecked();
+  await expect(
+    page.getByRole("button", { name: "启用定时预购" }),
+  ).toBeDisabled();
+  await consent.check();
+  await page.getByRole("button", { name: "启用定时预购" }).click();
+  expect(await page.evaluate(() => (window as any).plans[0].applecare)).toBe(
+    true,
+  );
 });
 
 test("purchase presets belong to one account", async ({ page }) => {
