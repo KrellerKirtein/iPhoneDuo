@@ -27,6 +27,7 @@ async function fixture(
       const root = window as any;
       root.sent = [];
       root.started = [];
+      root.plans = [];
       root.removed = [];
       root.finish = (id: string, changes: any) => {
         const t = tasks.find((t) => t.id === id);
@@ -101,6 +102,7 @@ async function fixture(
           };
           tasks.unshift(task);
           root.started.push({ accountId, action, id });
+          if (action === "preorder") root.plans.push(structuredClone(params));
           if (
             action === "login" ||
             action === "enroll" ||
@@ -112,6 +114,8 @@ async function fixture(
               kind: "password",
               label: "输入 Apple 账号密码",
             };
+          } else if (action === "preorder" || action === "preorder_resume") {
+            task.stage = "计划已就绪，等待开售";
           } else if (action === "purchase") {
             task.status = "waiting";
             task.prompt = {
@@ -288,6 +292,102 @@ async function enterWorkspace(page: Page) {
   await page.getByRole("button", { name: "检查并使用所选账号" }).click();
   await expect(page.getByRole("button", { name: "立即下单" })).toBeVisible();
 }
+
+test("scheduled purchase freezes Beijing time and stops at pending payment", async ({
+  page,
+}) => {
+  await fixture(page);
+  await page.goto("/");
+  await enterWorkspace(page);
+  await expect(page.getByLabel("开售时间（北京时间）")).toHaveValue(
+    "2026-10-16T20:00",
+  );
+  await expect(
+    page.getByRole("button", { name: "启用定时预购" }),
+  ).toBeDisabled();
+  await page.getByLabel("订单总额上限（人民币元）").fill("22000");
+  await page.getByLabel("备选门店编号").fill("R390, R401");
+  await page.getByLabel("取货人证件后四位").fill("123X");
+  await page.getByRole("checkbox", { name: /我授权/ }).check();
+  await page.getByRole("button", { name: "启用定时预购" }).click();
+  const plans = await page.evaluate(() => (window as any).plans);
+  expect(plans).toHaveLength(1);
+  expect(plans[0]).toMatchObject({
+    target_at: "2026-10-16T20:00:00+08:00",
+    quantity: 1,
+    max_total: "22000",
+    pickup_stores: ["R390", "R401"],
+    id_suffix: "123X",
+    authorized: true,
+    window_seconds: 300,
+  });
+  await expect(
+    page.getByRole("button", { name: "启用定时预购" }),
+  ).toBeDisabled();
+  await expect(page.getByRole("button", { name: "确认创建订单" })).toHaveCount(
+    0,
+  );
+  await page.evaluate(() => {
+    const root = window as any;
+    const task = root.started.find((task: any) => task.action === "preorder");
+    root.finish(task.id, {
+      status: "succeeded",
+      order_submitted: true,
+      result: {
+        success: true,
+        status: "pending_payment",
+        order_number: "W123456789",
+        amount_due: "RMB 21,499",
+      },
+    });
+  });
+  await expect(page.getByText("订单已创建，等待付款")).toBeVisible();
+  await expect(page.getByRole("button", { name: "获取二维码" })).toBeVisible();
+  expect(
+    await page.evaluate(() =>
+      (window as any).started.filter((task: any) => task.action === "qr"),
+    ),
+  ).toEqual([]);
+});
+
+test("uncertain order stays visible and resume is explicit", async ({
+  page,
+}) => {
+  await fixture(page);
+  await page.goto("/");
+  await enterWorkspace(page);
+  await page.getByRole("button", { name: "恢复已保存计划" }).click();
+  await page.evaluate(() => {
+    const root = window as any;
+    const task = root.started.find(
+      (task: any) => task.action === "preorder_resume",
+    );
+    root.finish(task.id, {
+      status: "failed",
+      order_submitted: true,
+      result: {
+        success: false,
+        status: "order_uncertain",
+        message: "尚未确认，只查单，不重新购买。",
+      },
+    });
+  });
+  await expect(page.getByText("订单结果待确认，已阻止重复下单")).toBeVisible();
+  await expect(page.getByRole("button", { name: "获取二维码" })).toHaveCount(0);
+  expect(
+    await page.evaluate(() =>
+      (window as any).started.filter((task: any) => task.action === "preorder"),
+    ),
+  ).toEqual([]);
+  await page.getByRole("button", { name: "恢复已保存计划" }).click();
+  expect(
+    await page.evaluate(() =>
+      (window as any).started.filter(
+        (task: any) => task.action === "preorder_resume",
+      ),
+    ),
+  ).toHaveLength(2);
+});
 
 test("new account is only added after password and OTP succeed", async ({
   page,

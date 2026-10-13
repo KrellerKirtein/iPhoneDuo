@@ -233,6 +233,8 @@ async function main() {
           "**/.git/**",
           "**/auth*.json",
           "**/checkout.json",
+          "**/preorder.json",
+          "**/preorder-address.json",
           "**/.dev-web.json",
           "**/.dev-web.json.*.tmp",
         ],

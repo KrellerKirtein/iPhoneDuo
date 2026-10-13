@@ -199,15 +199,34 @@ def region_data(flow, path, wanted=None, *, prefer_current=False):
 
 def shipping_options(flow, groups_path):
     payload = {}
-    for group in flow.require(groups_path).get('c', []):
+    policy = getattr(flow, 'policy', None)
+    groups = flow.require(groups_path).get('c', [])
+    if policy and not groups:
+        raise ValueError('配送分组响应不完整，未推断为无货。')
+    for group in groups:
         options_path = groups_path + '.' + group + '.shipmentOptionsGroups'
-        for option in flow.require(options_path).get('c', []):
+        option_groups = flow.require(options_path).get('c', [])
+        if policy and not option_groups:
+            raise ValueError('配送服务分组响应不完整。')
+        for option in option_groups:
             path = options_path + '.' + option + '.shippingOptions'
             node = flow.require(path)['d']
+            if policy and not isinstance(node.get('options'), list):
+                raise ValueError('配送服务响应不完整。')
             options = [(o['value'], o.get('label') or o.get('title') or
                         ' / '.join(str(o[k]) for k in ('deliveryQuote', 'deliveryTimeSlot', 'shippingCost') if o.get(k)) or o['value'])
                        for o in node.get('options', []) if o.get('value') and not o.get('disabled')]
-            selected = choose('配送服务', options, node.get('selectShippingOption')) if len(options) > 1 else options[0][0] if options else None
+            if policy:
+                selected = node.get('selectShippingOption')
+                if selected not in [key for key, _ in options]:
+                    selected = options[0][0] if len(options) == 1 else None
+                if not options:
+                    from preorder import Unavailable
+                    raise Unavailable('当前商品没有可用配送服务。')
+                if selected is None:
+                    raise ValueError('官网未明确默认配送服务，未擅自选择。')
+            else:
+                selected = choose('配送服务', options, node.get('selectShippingOption')) if len(options) > 1 else options[0][0] if options else None
             if selected is None:
                 raise ValueError('当前商品没有可用配送服务。')
             payload[path + '.selectShippingOption'] = selected
@@ -241,6 +260,9 @@ def pickup_contact(flow, config, config_path):
     save_config(config_path, config)
     payload.update({address + '.' + key: val for key, val in details.items()})
     payload.update(invoice_data(flow, path))
+    policy = getattr(flow, 'policy', None)
+    if policy and value(flow.model, path + '.selfPickupContact.nationalIdSelf') is not None:
+        payload[path + '.selfPickupContact.nationalIdSelf.nationalIdSelf'] = policy.plan['id_suffix']
     actions = flow.require(path).get('a', {})
     action = next((a for a in ('continueFromPickupContactToShipping', 'continueFromPickupContactToBilling') if a in actions), None)
     if not action:
@@ -261,7 +283,7 @@ def home_delivery(flow, config):
     if flow.require(selector)['d'].get('selectFulfillmentLocation') != 'HOME':
         raise ValueError('服务端未确认切换为送货，已停止。')
     tab = path + '.deliveryTab.delivery'
-    payload.update(region_data(flow, tab + '.deliveryLocation.address.provinceCityDistrictTabsForCheckout', config.get('delivery'), prefer_current=True))
+    payload.update(region_data(flow, tab + '.deliveryLocation.address.provinceCityDistrictTabsForCheckout', config.get('delivery'), prefer_current=not bool(getattr(flow, 'policy', None))))
     payload.update(shipping_options(flow, tab + '.shipmentGroups'))
     flow.action(path, 'continueFromFulfillmentToShipping', payload)
     flow.require('checkout.shipping')
@@ -344,7 +366,12 @@ def shipping(flow, config_path, auth_path=None):
         current = saved[0]
     can_add = any(a.get('value') == 'newAddr' and not a.get('disabled')
                   for a in selector.get('radioAddresses', []))
-    if saved:
+    policy = getattr(flow, 'policy', None)
+    if policy:
+        if not can_add:
+            raise ValueError('官网未提供填写计划地址的入口，未改用其他地址。')
+        selected = 'newAddr'
+    elif saved:
         choices = [('saved', '使用官网已有的地址')]
         if can_add:
             choices.append(('newAddr', '使用本地快捷地址进行配置'))
@@ -379,7 +406,7 @@ def shipping(flow, config_path, auth_path=None):
         payload.update({address + '.' + k: details[k] for k in ('lastName', 'firstName')})
         payload.update({address + '.street': config['address']['street'], address + '.street2': config.get('address', {}).get('street2', ''),
                         address + '.copyContact.fullDaytimePhone': details['fullDaytimePhone'],
-                        path + '.addressSelector.newAddress.saveToAddressBook': 'true'})
+                         path + '.addressSelector.newAddress.saveToAddressBook': 'false' if policy else 'true'})
         email = details['emailAddress']
         print('收货地址：' + ' '.join(config['delivery'].values()) + ' ' + config['address']['street'])
     else:

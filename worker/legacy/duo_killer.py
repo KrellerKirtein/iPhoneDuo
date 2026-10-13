@@ -569,6 +569,14 @@ def cart_item(flow, part):
     return matches[0] if matches else (None, None)
 
 
+class CartNotReady(ValueError):
+    """已重新读取购物袋，但目标商品尚未确认加入。"""
+
+
+class TemporaryCheckoutError(ValueError):
+    """瞬时服务错误；自动模式只允许在尚未提交订单时重新读取状态。"""
+
+
 def add_to_bag(part=PART, quantity=1, *, set_total=False, flow=None):
     part = normalize_sku(part)
     if type(quantity) is not int or quantity < 1:
@@ -590,7 +598,9 @@ def add_to_bag(part=PART, quantity=1, *, set_total=False, flow=None):
                 add_error = _add_one_to_bag(session, part)
                 flow.page(BASE_URL + "/shop/bag", "首次加购后购物袋")
                 item_id, item = cart_item(flow, part)
-                if item is None or int(field(item, "itemQuantity.d.quantity", 0)) != 1:
+                if item is None:
+                    raise CartNotReady(add_error + "购物袋尚未确认目标商品，请读取当前状态后再试。")
+                if int(field(item, "itemQuantity.d.quantity", 0)) != 1:
                     raise ValueError(add_error + "首次加购未确认数量为一件，请先查袋，不要直接重复加购。")
             current = int(field(item, "itemQuantity.d.quantity"))
             maximum = field(item, "itemQuantity.d.maxQuantity")
@@ -612,6 +622,8 @@ def add_to_bag(part=PART, quantity=1, *, set_total=False, flow=None):
                     "item_ids": [item_id], "items": [{"item_id": item_id, "part": part, "quantity": target}],
                     "line_total": line_total, "bag_total": bag_total}
         except requests.RequestException:
+            if getattr(flow, 'policy', None):
+                raise  # 自动计划从新购物袋恢复，不能重放未确认的加购请求。
             raise ValueError("购物袋请求未能确认结果，已停止；请先运行 -bag 核对数量，不要直接重跑 -k 或 -a。") from None
         finally:
             if standalone:
@@ -676,6 +688,8 @@ def write_private_json(path, data):
             private_fd(file.fileno())
             json.dump(data, file, ensure_ascii=False, indent=2)
             file.write("\n")
+            file.flush()
+            os.fsync(file.fileno())
         os.replace(name, path)
     finally:
         if os.path.exists(name):
@@ -687,6 +701,7 @@ class Checkout:
 
     def __init__(self, session):
         self.session = session
+        self.policy = None
         self.model = {}
         self.headers = {}
         self.url = BASE_URL + "/shop/bag"
@@ -761,7 +776,8 @@ class Checkout:
         response = request_get(self.session, name, self.apple_url(url), method="POST",
                                data=data or {}, headers=headers, allow_redirects=False)
         if response.status_code != 200:
-            raise ValueError(f"{name} 返回 HTTP {response.status_code}，已停止。")
+            error = TemporaryCheckoutError if response.status_code in (429, 502, 503, 504) else ValueError
+            raise error(f"{name} 返回 HTTP {response.status_code}，已停止。")
         try:
             result = response.json()
             status = str(result["head"]["status"])
@@ -809,12 +825,17 @@ def reauthenticate_checkout(flow):
 
 def checkout_delivery(flow):
     from checkout_options import fulfillment
-    fulfillment(flow, ROOT / "checkout.json")
+    policy = getattr(flow, 'policy', None)
+    if policy:
+        policy.fulfillment(flow)
+    else:
+        fulfillment(flow, ROOT / "checkout.json")
 
 
 def checkout_shipping(flow):
     from checkout_options import shipping
-    shipping(flow, ROOT / "checkout.json", AUTH_PATH)
+    policy = getattr(flow, 'policy', None)
+    shipping(flow, policy.config_path if policy else ROOT / "checkout.json", AUTH_PATH)
 
 
 def model_item_nodes(model):
@@ -900,6 +921,9 @@ def payment_result(flow):
     if (header.get("isPost") or parsed.scheme != "https" or parsed.hostname != "openapi.alipay.com"
             or parsed.path != "/gateway.do" or parsed.username or parsed.password):
         raise ValueError("下单结果页未提供预期的支付宝 GET 支付链接，请在官网查看订单；不要重复下单。")
+    if not re.fullmatch(r'W\d{6,}', str(header.get('orderNumber', ''))):
+        raise ValueError('下单结果缺少有效订单号，请查询订单确认；不要重复下单。')
+    order_price(header.get('amountDue'))
     return {"success": True, "status": "pending_payment", "order_number": header.get("orderNumber"),
             "amount_due": header.get("amountDue"), "payment_url": url,
             "message": "订单已创建，尚未付款；请打开支付链接完成支付宝支付。"}
@@ -975,13 +999,19 @@ def pay_bag(*, flow=None):
                 raise ValueError("订单复核未通过：商品、数量、支付方式或下单状态不符合预期。")
             confirm_order(flow.model)
             save_auth(session)
+            policy = getattr(flow, 'policy', None)
+            if policy:
+                policy.before_submit()
             interaction.report_stage("正在提交订单", order_submitted=True)
             flow.action("checkout.review.placeOrder", "continueFromReviewToProcess")
             result = finish_payment(flow)
+            if policy:
+                policy.validate_result(result)
             if PAYMENT_ROOT is not None:
                 # Keep the issued payment link even if fetching its QR image is interrupted.
                 write_private_json(PAYMENT_ROOT / "payment.json", result)
-            payment_qr(result)
+            if not policy:
+                payment_qr(result)
             write_private_json((PAYMENT_ROOT or ROOT) / "payment.json", result)
             return result
         finally:

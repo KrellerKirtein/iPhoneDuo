@@ -74,9 +74,9 @@ def main():
             service = Service(channel, root, task_dir, account)
             service.enable_logging()
             result = service.run(request['action'], request.get('params', {}))
-            channel.emit('result', result=result)
+            channel.emit('result', result=result, order_submitted=service.submitted)
     except Cancelled:
-        channel.emit('cancelled', message='任务已取消。')
+        channel.emit('cancelled', message='任务已取消。', order_submitted=bool(service and service.submitted))
     except Exception as exc:
         error = exc
         # Never include requests' exception URLs, headers, or a traceback with locals.

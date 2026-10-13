@@ -13,6 +13,8 @@ artifacts/
 auth*.json
 accounts.json
 checkout.json
+preorder.json
+preorder-address.json
 purchase.json
 task.json
 payment*.json

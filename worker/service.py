@@ -28,6 +28,7 @@ class Service:
         self.authentication_failed = False
         self.action = None
         self.submitted = False
+        self.preorder_policy = None
         self.auth = self.root / 'auth.json'
         self.checkout = self.root / 'checkout.json'
         duo_killer.ROOT, duo_killer.AUTH_PATH, duo_killer.LOG_PATH = self.root, self.auth, self.task_dir / 'requests.log'
@@ -78,6 +79,8 @@ class Service:
         return self.account, self.password
 
     def text(self, label, default=''):
+        if self.preorder_policy and '验证码' not in label:
+            raise ValueError('自动计划缺少必要信息：' + label)
         kind = 'code' if '验证码' in label else 'text'
         label = label.replace('👉 ', '')
         fields = {}
@@ -96,9 +99,13 @@ class Service:
         return value
 
     def choose(self, label, options, default=None):
+        if self.preorder_policy:
+            raise ValueError('自动计划遇到尚未预设的选项：' + label)
         return self.channel.prompt('select', label, options=[{'value': k, 'label': v} for k, v in options], default=default)
 
     def confirm(self, details):
+        if self.preorder_policy:
+            return self.preorder_policy.confirm(details)
         return self.channel.prompt('confirm', '确认商品与金额，创建订单', details=details, account=self.account)
 
     def stage(self, stage, **fields):
@@ -195,6 +202,16 @@ class Service:
     def run(self, action, params):
         self.action = action
         self.channel.checkpoint()
+        if action in ('preorder', 'preorder_resume', 'preorder_status'):
+            import preorder
+            if action == 'preorder_status':
+                return preorder.PlanStore(self.root).public()
+            result = preorder.run(self, params, resume=action == 'preorder_resume')
+            self.persist_password()
+            return result
+        if action in ('purchase', 'checkout', 'add'):
+            from preorder import guard_manual_purchase
+            guard_manual_purchase(self.root)
         if action == 'address_read':
             return {'success': True, 'config': checkout_options.read_config(self.checkout)}
         if action == 'address_save':

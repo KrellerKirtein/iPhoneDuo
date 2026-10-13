@@ -13,6 +13,9 @@ export type Action =
   | "bag"
   | "add"
   | "purchase"
+  | "preorder"
+  | "preorder_resume"
+  | "preorder_status"
   | "checkout"
   | "orders"
   | "catalog"
@@ -69,6 +72,9 @@ export const actionNames: Record<Action, string> = {
   bag: "查询购物袋",
   add: "设置购买数量",
   purchase: "购买商品",
+  preorder: "定时预购",
+  preorder_resume: "恢复预购与查单",
+  preorder_status: "查看预购计划",
   checkout: "结算购物袋",
   orders: "查询订单",
   catalog: "查询商品",

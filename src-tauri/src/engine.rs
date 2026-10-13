@@ -24,6 +24,9 @@ const ACTIONS: &[&str] = &[
     "bag",
     "add",
     "purchase",
+    "preorder",
+    "preorder_resume",
+    "preorder_status",
     "checkout",
     "catalog",
     "address_read",
@@ -750,10 +753,15 @@ pub fn apply_event(task: &mut Task, event: &Value) {
             }
         }
         "result" => {
-            task.status = "succeeded".into();
+            let uncertain = event["result"]["status"] == "order_uncertain";
+            task.status = if uncertain { "failed" } else { "succeeded" }.into();
             task.result = Some(event["result"].clone());
             task.prompt = None;
-            task.stage = "已完成".into();
+            task.stage = if uncertain {
+                "订单结果待确认，已阻止重复下单"
+            } else {
+                "已完成"
+            }.into();
         }
         "error" => {
             task.status = "failed".into();
@@ -814,6 +822,17 @@ mod tests {
         assert!(validate_reply(&t, "a", "p", &json!("012345")).is_ok());
         assert!(validate_reply(&t, "b", "p", &json!("012345")).is_err());
         assert!(validate_reply(&t, "a", "old", &json!("012345")).is_err());
+    }
+    #[test]
+    fn uncertain_preorder_is_not_reported_as_success() {
+        let mut t = task();
+        t.action = "preorder".into();
+        apply_event(&mut t, &json!({"type":"result", "order_submitted":true,
+            "result":{"success":false,"status":"order_uncertain"}}));
+        assert_eq!(t.status, "failed");
+        assert!(t.order_submitted);
+        assert_eq!(t.result.unwrap()["status"], "order_uncertain");
+        assert!(t.prompt.is_none());
     }
     #[test]
     fn confirmation_is_explicit_and_selection_is_constrained() {

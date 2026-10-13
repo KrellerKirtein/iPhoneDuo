@@ -32,6 +32,7 @@ import { AccountGate } from "./AccountGate";
 import { RemoveAccountDialog } from "./RemoveAccountDialog";
 import { SelectField } from "./SelectField";
 import { ActiveTaskNav } from "./ActiveTaskNav";
+import { PreorderForm } from "./PreorderForm";
 import {
   active,
   LOCAL_ID,
@@ -609,6 +610,12 @@ export default function App() {
                           </div>
                         </form>
                       </section>
+                      <PreorderForm
+                        key={account.id}
+                        sku={sku}
+                        busy={busy}
+                        start={start}
+                      />
                     </>
                   )}
                   {tab === "bag" && (
@@ -769,17 +776,19 @@ export default function App() {
                         )}
                       </>
                     )}
-                    {task.status === "succeeded" && task.result && (
-                      <Result
-                        task={task}
-                        onOrders={() => {
-                          setTab("orders");
-                          start("orders");
-                        }}
-                        onQr={() => start("qr", { source_task: task.id })}
-                        disabled={busy}
-                      />
-                    )}
+                    {task.result &&
+                      (task.status === "succeeded" ||
+                        task.result.status === "order_uncertain") && (
+                        <Result
+                          task={task}
+                          onOrders={() => {
+                            setTab("orders");
+                            start("orders");
+                          }}
+                          onQr={() => start("qr", { source_task: task.id })}
+                          disabled={busy}
+                        />
+                      )}
                     {task.order_submitted &&
                       ["failed", "cancelled", "interrupted"].includes(
                         task.status,
@@ -995,6 +1004,53 @@ function Result({
 }) {
   const { format } = useAccountPrivacy();
   const result = task.result!;
+  if (
+    ["order_uncertain", "order_confirmed", "preorder_plan"].includes(
+      result.status,
+    )
+  )
+    return (
+      <div className="payment" role="status">
+        <h3>
+          {result.status === "order_uncertain"
+            ? "订单结果待确认，已阻止重复下单"
+            : result.status === "order_confirmed"
+              ? "已查到匹配订单，购买已停止"
+              : "已保存的预购计划"}
+        </h3>
+        {result.order_number && <p>订单 {result.order_number}</p>}
+        {result.target_at && (
+          <p>
+            {result.sku} ·{" "}
+            {new Date(result.target_at).toLocaleString("zh-CN", {
+              timeZone: "Asia/Shanghai",
+            })}
+            （北京时间）
+          </p>
+        )}
+        {result.state && (
+          <p>
+            阶段：
+            {(
+              {
+                prepared: "已准备",
+                waiting: "等待开售",
+                running: "执行中",
+                paused: "已暂停",
+                expired: "已过期",
+                submitting: "提交中",
+                uncertain: "待确认",
+                confirmed: "已确认",
+              } as Record<string, string>
+            )[result.state] || "未知"}
+          </p>
+        )}
+        <p>{result.message}</p>
+        <button disabled={disabled} onClick={onOrders}>
+          查询官网订单
+        </button>
+      </div>
+    );
   if (result.status === "pending_payment")
     return (
       <div className="payment">

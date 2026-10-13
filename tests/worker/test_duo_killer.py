@@ -1313,6 +1313,7 @@ class PurchaseFlowTests(unittest.TestCase):
                     patch.object(duo_killer, "finish_payment", return_value={"success": True}) as finish, \
                     patch.object(duo_killer, "payment_qr") as qr, contextlib.redirect_stdout(io.StringIO()):
                 flow = factory.return_value
+                flow.policy = None  # 普通结账；MagicMock 不应凭空生成自动购买策略。
                 flow.model = self.review_model()
                 flow.require.side_effect = lambda path: duo_killer.field(flow.model, path)
                 flow.apple_url.return_value = "https://secure8.www.apple.com.cn/shop/checkout/status"
