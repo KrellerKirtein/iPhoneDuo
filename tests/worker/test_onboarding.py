@@ -47,6 +47,25 @@ class AccountCheckTests(unittest.TestCase):
         self.assertEqual(self.service.run('me', {}), self.person)
         self.login.assert_called_once_with()
 
+    def test_initial_network_or_http_failure_does_not_trigger_login_or_remove_account(self):
+        for status in (429, 503, None):
+            with self.subTest(status=status):
+                response = requests.Response()
+                response.status_code = status or 200
+                error = requests.HTTPError(response=response) if status else requests.Timeout('offline')
+                self.info.side_effect = error
+                self.login.reset_mock()
+                self.service.authentication_requested = False
+                self.service.authentication_failed = False
+                original = self.service.auth.read_bytes()
+                with self.assertRaises(type(error)) as caught:
+                    self.service.run('me', {})
+                self.login.assert_not_called()
+                self.assertFalse(self.service.should_remove_account(caught.exception))
+                self.service.cleanup_credentials(caught.exception)
+                self.assertEqual(self.service.auth.read_bytes(), original)
+                self.service.vault.delete.assert_not_called()
+
     def test_account_page_reauthentication_is_not_followed_by_another_login(self):
         def reauthenticate(session):
             self.service.authentication_requested = True
@@ -93,6 +112,36 @@ class AccountCheckTests(unittest.TestCase):
             with self.assertRaises(type(error)) as caught:
                 self.service.run('me', {})
             self.assertFalse(self.service.should_remove_account(caught.exception))
+
+    def test_browser_context_failure_after_fallback_preserves_account_and_credentials(self):
+        from apple_login import BrowserContextError
+        for status in (None, 503):
+            with self.subTest(status=status):
+                error = ValueError('浏览器上下文不可用')
+                error.__cause__ = BrowserContextError(str(error), status=status)
+                self.info.return_value = {'logged_in': False}
+                self.login.side_effect = error
+                self.service.authentication_failed = False
+                original = self.service.auth.read_bytes()
+                with self.assertRaises(ValueError) as caught:
+                    self.service.run('me', {})
+                self.assertFalse(self.service.authentication_failed)
+                self.assertFalse(self.service.should_remove_account(caught.exception))
+                self.service.cleanup_credentials(caught.exception)
+                self.assertEqual(self.service.auth.read_bytes(), original)
+                self.service.vault.delete.assert_not_called()
+
+    def test_wrapped_service_failure_during_identity_read_does_not_trigger_fallback(self):
+        from apple_login import LoginError
+        wrapped = ValueError('service unavailable')
+        wrapped.__cause__ = LoginError('service unavailable', status=503)
+        for error in (wrapped, duo_killer.TemporaryCheckoutError('service unavailable')):
+            with self.subTest(error=type(error).__name__):
+                self.info.side_effect = error
+                with self.assertRaises(ValueError):
+                    self.service.run('me', {})
+                self.login.assert_not_called()
+                self.assertFalse(self.service.should_remove_account(error))
 
     def test_business_errors_cancel_and_first_enrollment_do_not_remove_account(self):
         from protocol import Cancelled

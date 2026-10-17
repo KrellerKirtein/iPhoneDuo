@@ -1,6 +1,7 @@
 """账号级定时购买计划；提交结果不明时只查单，绝不重新提交。"""
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from email.utils import parsedate_to_datetime
 import json
 import re
 import uuid
@@ -10,9 +11,14 @@ import requests
 import checkout_options as options
 import duo_killer as shop
 import payment_options
+from store_status import StoreClosedError
 
 
 SEALED = {'submitting', 'uncertain', 'confirmed'}
+TEST_SKU = 'MJY64CH/A'
+TEST_MAX_TOTAL_CENTS = 1099900
+PREPARE_SECONDS = 10
+PREPARED_MAX_AGE = 15
 
 
 class Unavailable(ValueError):
@@ -55,6 +61,9 @@ def validate_plan(data):
     target = parse_time(data.get('target_at'))
     quantity = data.get('quantity', 1)
     applecare = data.get('applecare', False)
+    test_order_authorized = data.get('test_order_authorized', False)
+    if type(test_order_authorized) is not bool:
+        raise ValueError('测试订单授权必须是勾选状态。')
     if type(applecare) is not bool:
         raise ValueError('AppleCare 选项必须是勾选状态。')
     if type(quantity) is not int or quantity != 1:
@@ -75,7 +84,7 @@ def validate_plan(data):
             'target_at': target.isoformat(), 'window_seconds': duration,
             'max_total_cents': max_total_cents,
             'pickup_stores': list(dict.fromkeys(stores)), 'id_suffix': suffix.upper(),
-            'authorized': True}
+            'authorized': True, 'test_order_authorized': test_order_authorized}
 
 
 class PlanStore:
@@ -88,6 +97,10 @@ class PlanStore:
             if (not isinstance(self.data, dict) or self.data.get('version') != 1 or not isinstance(self.data.get('plan'), dict)
                     or self.data.get('state') not in {'prepared', 'waiting', 'running', 'paused', 'expired', *SEALED}):
                 raise ValueError('购买计划记录无法识别，请保留文件并先核对官网订单。')
+            test = self.data.get('test_order')
+            if test is not None and (not isinstance(test, dict) or not isinstance(test.get('plan'), dict)
+                                     or test.get('state') not in {'prepared', 'expired', 'skipped', *SEALED}):
+                raise ValueError('测试订单记录无法识别，请保留文件并先核对官网订单。')
 
     def save(self, **changes):
         """把状态及关联证据一起原子落盘，写入异常直接阻断后续业务请求。"""
@@ -104,13 +117,32 @@ class PlanStore:
                 'payment_label': payment_options.description(payment_options.validate(
                     plan.get('payment_method', 'alipay'), plan.get('installment_term'))),
                 'order_number': self.data.get('result', {}).get('order_number'),
+                **self.test_summary(),
                 'message': self.data.get('message', '')}
+
+    def test_summary(self):
+        """状态及正式订单结果中保留测试是否跳过，避免误认为 Cookie 已通过实测。"""
+        test = self.data.get('test_order', {})
+        return {'test_order_state': test.get('state'), 'test_order_message': test.get('message', ''),
+                'test_order_number': test.get('result', {}).get('order_number')}
+
+
+class TestOrderStore(PlanStore):
+    """测试订单与正式订单共用原子文件和账号锁，分别持久化提交意图与结果。"""
+    def __init__(self, parent):
+        self.parent = parent
+        self.data = parent.data.get('test_order', {})
+
+    def save(self, **changes):
+        """先原子保存测试记录，之后才允许发送该测试订单的创建请求。"""
+        self.data = {**self.data, **changes, 'updated_at': datetime.now(timezone.utc).isoformat()}
+        self.parent.save(test_order=self.data)
 
 
 def guard_manual_purchase(root):
     """普通购买不能绕过自动计划仍待确认的提交意图。"""
     store = PlanStore(root)
-    if store.data.get('state') in SEALED:
+    if store.data.get('state') in SEALED or store.data.get('test_order', {}).get('state') in SEALED:
         raise ValueError('已有计划提交记录，请先查询官网订单；已阻止再次购买。')
 
 
@@ -318,6 +350,8 @@ def reconcile(service, store, session):
                 result = {'success': True, 'status': 'order_confirmed',
                           'order_number': candidates[0]['order_number'], 'payment_status': 'unknown',
                           'message': '订单列表已确认新增的匹配订单，已停止购买；请在官网核对付款状态。'}
+                if store.data.get('test_order'):
+                    result.update(store.test_summary())
                 store.save(state='confirmed', result=result, message=result['message'])
                 return result
             if len(candidates) > 1:
@@ -332,6 +366,225 @@ def reconcile(service, store, session):
     return result
 
 
+def is_store_unavailable(error):
+    """只把明确闭店页或 HTTP 503 作为开售前可跳过测试的依据。"""
+    for cause in (error, getattr(error, '__cause__', None)):
+        if isinstance(cause, StoreClosedError) or getattr(cause, 'status', None) == 503:
+            return True
+        response = getattr(cause, 'response', None)
+        if response is not None and response.status_code == 503:
+            return True
+    return False
+
+
+def retry_after(error):
+    """读取请求或浏览器包装异常携带的等待要求，不输出响应及令牌。"""
+    for cause in (error, getattr(error, '__cause__', None)):
+        response = getattr(cause, 'response', None)
+        header = response.headers.get('Retry-After') if response is not None else getattr(cause, 'retry_after', None)
+        if isinstance(header, str) and header:
+            return header
+    return None
+
+
+def retry_delay(error, target, now=None):
+    """开售后前 30 秒每秒恢复，至 120 秒每 2 秒，再每 5 秒；服务端等待优先。"""
+    now = now or datetime.now(timezone.utc)
+    response = getattr(error, 'response', None)
+    if (isinstance(error, requests.HTTPError) and not isinstance(error, StoreClosedError)
+            and response is not None and response.status_code not in (429, 502, 503, 504)):
+        raise error
+    header = retry_after(error)
+    if header:
+        try:
+            if str(header).strip().isdigit():
+                return max(1, int(header))
+            retry_at = parsedate_to_datetime(header)
+            if retry_at.tzinfo is not None:
+                return max(1, (retry_at - now).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            pass
+    elapsed = (now - target).total_seconds()
+    return 1 if elapsed < 30 else 2 if elapsed < 120 else 5
+
+
+def wait_retry(service, error, target, deadline):
+    """等待不超过本阶段剩余窗口；等待结束由调用方检查截止时间，不提前越过限流。"""
+    now = datetime.now(timezone.utc)
+    delay = retry_delay(error, target, now)
+    remaining = max(0, (deadline - now).total_seconds())
+    service.channel.cancelled.wait(min(delay, remaining))
+    service.channel.checkpoint()
+
+
+def defer_requests(store, error):
+    """开售前跳过某阶段时持久保存服务端等待要求，下一阶段不能提前发请求。"""
+    if retry_after(error):
+        now = datetime.now(timezone.utc)
+        until = now + timedelta(seconds=retry_delay(error, parse_time(store.data['plan']['target_at']), now))
+        previous = store.data.get('retry_not_before')
+        if not previous or until > parse_time(previous):
+            store.save(retry_not_before=until.isoformat())
+
+
+def deferred_until(store):
+    """返回尚未结束的服务端等待时间；过期记录不再阻止请求。"""
+    value = store.data.get('retry_not_before')
+    until = parse_time(value) if value else None
+    return until if until and until > datetime.now(timezone.utc) else None
+
+
+def read_baseline(service, store, session):
+    """在定时等待前读取查单基线，给认证和暂时网络错误留出准备时间。"""
+    for attempt in range(3):
+        try:
+            baseline = shop.order_list(session)
+            break
+        except requests.RequestException as error:
+            if is_store_unavailable(error) or attempt == 2:
+                raise
+            target = parse_time(store.data['plan']['target_at'])
+            wait_retry(service, error, target, target + timedelta(seconds=store.data['plan']['window_seconds']))
+    if baseline.get('success') is not True or type(baseline.get('has_more')) is not bool:
+        raise ValueError('未取得有效订单列表，不能建立防重基线。')
+    store.save(baseline=[o['order_number'] for o in baseline['orders']], baseline_complete=not baseline['has_more'])
+
+
+def prepare_session(service, store, session):
+    """准备可延期，但同一计划必须在任何建单前取得登录会话及订单基线。"""
+    shop.ensure_strong_login(session)
+    if 'baseline' not in store.data:
+        read_baseline(service, store, session)
+
+
+def read_cart(session, policy):
+    """取得同一会话的实时购物袋和登录标志；只允许本阶段指定商品。"""
+    flow = PlanCheckout(session, policy)
+    flow.page(shop.BASE_URL + '/shop/bag', '读取预购购物袋')
+    if not shop.check_login(session, page=flow.page_response)['logged_in']:
+        raise ValueError('会话已失效，请重新登录后恢复计划。')
+    items = shop.model_items(shop.field(flow.model, 'shoppingCart.items', {}))
+    if any(sku.upper() != policy.plan['sku'] for sku, _ in items):
+        raise ValueError('购物袋包含计划以外的商品，请先人工处理。')
+    return flow
+
+
+def warmup(service, session, policy):
+    """临开售读取购物袋与商品令牌；短暂复用内存结果，不持久化动态令牌。"""
+    started = shop.perf_counter()
+    flow = read_cart(session, policy)
+    if shop.cart_item(flow, policy.plan['sku'])[1] is None:
+        flow.prepared_add = shop.prepare_add_to_bag(session, policy.plan['sku'])
+    flow.prepared_at = started
+    service.stage('正式商品预热完成，等待开售')
+    return flow
+
+
+def purchase(service, store, session, policy, *, prepared=None, test_order=False):
+    """在阶段窗口内建一笔订单；首次可用预热结果，任何恢复先重读购物袋。"""
+    target = parse_time(policy.plan['target_at'])
+    while datetime.now(timezone.utc) < policy.deadline:
+        service.channel.checkpoint()
+        until = deferred_until(store)
+        if until:
+            wait_until(service, min(until, policy.deadline))
+            continue
+        try:
+            if prepared is not None and 0 <= shop.perf_counter() - prepared.prepared_at <= PREPARED_MAX_AGE:
+                flow = prepared
+            else:
+                prepare_session(service, store, session)
+                policy.before_action()
+                flow = read_cart(session, policy)
+            prepared = None
+            shop.add_to_bag(policy.plan['sku'], quantity=1, set_total=True, flow=flow)
+            shop.configure_applecare(flow, policy.plan['sku'], policy.plan.get('applecare', False))
+            arguments = {'flow': flow, 'payment_method': policy.plan.get('payment_method', 'alipay'),
+                         'installment_term': policy.plan.get('installment_term')}
+            if test_order:
+                arguments['save_payment'] = False
+            result = shop.pay_bag(**arguments)
+            policy.validate_result(result)
+            if test_order:
+                result = {key: value for key, value in result.items() if key not in ('payment_url', 'qr_image', 'qr_data')}
+                result.update(test_order=True, message='测试订单已创建，不付款、不自动取消。')
+            elif store.data.get('test_order'):
+                result.update(store.test_summary())
+                shop.write_private_json(service.task_dir / 'payment.json', result)
+            store.save(state='confirmed', result=result, message=result.get('message', '订单已创建，等待付款。'))
+            return result
+        except Exception as error:
+            prepared = None
+            if store.data['state'] in SEALED:
+                return reconcile(service, store, session)
+            if test_order and is_store_unavailable(error):
+                raise  # 交给测试阶段记录 skipped；已有提交意图的异常必须先走查单。
+            if not is_store_unavailable(error) and not isinstance(
+                    error, (requests.RequestException, shop.CartNotReady, shop.TemporaryCheckoutError, Unavailable)):
+                raise
+            service.stage('测试订单尚未完成，读取当前状态后再试' if test_order else '尚未完成加购或履约，读取当前状态后再试')
+            wait_retry(service, error, target, policy.deadline)
+    store.save(state='expired', message='执行窗口结束，未创建订单。')
+    return store.public()
+
+
+def skip_test_order(service, parent, store, message, error=None):
+    """只跳过从未提交的测试；状态原子保存后，正式流程可继续且恢复不补做。"""
+    if store.data.get('state') in SEALED:
+        raise ValueError('测试订单已有提交记录，不能跳过查单保护。')
+    if error is not None:
+        defer_requests(parent, error)
+    store.save(state='skipped', message=message)
+    parent.save(message=message)
+    service.stage(message)
+
+
+def run_test_order(service, parent, session, config_path):
+    """开售前五分钟真实建测试单；确认后把测试单号纳入正式基线，恢复不重复建单。"""
+    store = TestOrderStore(parent)
+    target = parse_time(parent.data['plan']['target_at'])
+    if store.data.get('state') == 'skipped':
+        service.stage(store.data['message'])
+        return None
+    if store.data.get('state') in SEALED:
+        service.submitted = True
+        service.stage('恢复测试订单结果，仅查询订单')
+        result = reconcile(service, store, session)
+    else:
+        wait_until(service, target - timedelta(minutes=5))
+        plan = {**parent.data['plan'], 'sku': TEST_SKU, 'applecare': False,
+                'max_total_cents': TEST_MAX_TOTAL_CENTS,
+                'target_at': (target - timedelta(minutes=5)).isoformat(), 'window_seconds': 240}
+        store.data = {'version': 1, 'plan': plan, 'address': parent.data['address']}
+        store.save(state='prepared')
+        if datetime.now(timezone.utc) >= target - timedelta(minutes=1):
+            skip_test_order(service, parent, store, '已过测试窗口，跳过尚未提交的测试订单；未验证 Cookie，继续正式抢购。')
+            return None
+        try:
+            if deferred_until(parent):
+                raise StoreClosedError('商城仍要求等待，测试尚未提交。')
+            prepare_session(service, parent, session)
+            store.save(baseline=parent.data['baseline'], baseline_complete=parent.data['baseline_complete'])
+            policy = Policy(service, store, config_path)
+            service.preorder_policy = policy
+            service.stage('开售前测试：创建 iPhone 18 Pro Max 待付款订单，不付款')
+            result = purchase(service, store, session, policy, test_order=True)
+        except Exception as error:
+            if store.data['state'] in SEALED or not is_store_unavailable(error):
+                raise
+            message = '商城未开放或暂不可用，已跳过尚未提交的测试订单；未验证 Cookie，继续等待正式抢购。'
+            skip_test_order(service, parent, store, message, error)
+            return None
+    if store.data['state'] != 'confirmed':
+        parent.save(state='paused', message='测试订单尚未确认，正式抢购未启动；恢复计划先查询测试订单。')
+        return {**result, 'test_order': True, 'message': parent.data['message']}
+    number = result['order_number']
+    parent.save(baseline=list(dict.fromkeys([*parent.data['baseline'], number])),
+                message=f'测试订单 {number} 已确认，不付款；等待正式抢购。')
+    service.stage(parent.data['message'])
+    return None
+
+
 def run(service, params, *, resume=False):
     """执行或恢复单账号购买计划；任何提交意图都先恢复结果而不是重发购买。"""
     store = PlanStore(service.root)
@@ -340,7 +593,8 @@ def run(service, params, *, resume=False):
         if store.data['result'].get('status') == 'pending_payment':
             shop.write_private_json(service.task_dir / 'payment.json', store.data['result'])
         return store.data['result']
-    if not resume and store.data.get('state') not in SEALED:
+    test_sealed = store.data.get('test_order', {}).get('state') in SEALED
+    if not resume and store.data.get('state') not in SEALED and not test_sealed:
         from service import validate_address
         plan = validate_plan(params)
         address = validate_address(options.read_config(service.checkout))
@@ -349,7 +603,7 @@ def run(service, params, *, resume=False):
     elif not store.data:
         raise ValueError('尚未保存可恢复的购买计划。')
     sealed = store.data['state'] in SEALED
-    service.submitted = sealed
+    service.submitted = sealed or test_sealed
     if not sealed:
         payment_options.validate(store.data['plan'].get('payment_method', 'alipay'),
                                  store.data['plan'].get('installment_term'))
@@ -362,69 +616,48 @@ def run(service, params, *, resume=False):
                 return reconcile(service, store, session)
             target = parse_time(store.data['plan']['target_at'])
             deadline = target + timedelta(seconds=store.data['plan']['window_seconds'])
-            if datetime.now(timezone.utc) >= deadline:
+            if datetime.now(timezone.utc) >= deadline and not test_sealed:
                 store.save(state='expired', message='计划已超过执行窗口，未补发订单。')
                 return store.public()
             service.stage('预购准备：检查登录，必要时请完成验证')
-            shop.ensure_strong_login(session)
+            try:
+                if not deferred_until(store):
+                    prepare_session(service, store, session)
+            except Exception as error:
+                if not is_store_unavailable(error):
+                    raise
+                defer_requests(store, error)
+                service.stage('商城未开放或暂不可用，登录及订单基线准备延后，继续等待开售')
             store.save(state='waiting', message='等待计划时间，电脑须保持唤醒。')
-            service.stage('等待北京时间 ' + target.astimezone(timezone(timedelta(hours=8))).strftime('%m-%d %H:%M:%S') + '，开售前检查会话')
-            wait_until(service, target - timedelta(seconds=30))
+            config_path = service.task_dir / 'preorder-address.json'
+            shop.write_private_json(config_path, store.data['address'])
+            if store.data['plan'].get('test_order_authorized'):
+                result = run_test_order(service, store, session, config_path)
+                if result is not None:
+                    return result
+            service.preorder_policy = None
+            service.stage('等待北京时间 ' + target.astimezone(timezone(timedelta(hours=8))).strftime('%m-%d %H:%M:%S') + '，开售前 10 秒预热')
+            wait_until(service, target - timedelta(seconds=PREPARE_SECONDS))
             if datetime.now(timezone.utc) >= deadline:
                 store.save(state='expired', message='唤醒时已超过执行窗口，未补发订单。')
                 return store.public()
-            shop.ensure_strong_login(session)
-            for attempt in range(3):
-                try:
-                    baseline = shop.order_list(session)
-                    break
-                except requests.RequestException:
-                    if attempt == 2:
-                        raise
-                    service.channel.cancelled.wait(2)
-                    service.channel.checkpoint()
-            if baseline.get('success') is not True or type(baseline.get('has_more')) is not bool:
-                raise ValueError('未取得有效订单列表，不能建立防重基线。')
-            store.save(baseline=[o['order_number'] for o in baseline['orders']],
-                       baseline_complete=not baseline['has_more'])
-            service.stage('预检完成，等待开售；不会提前加购或下单')
-            wait_until(service, target)
-            store.save(state='running')
-            config_path = service.task_dir / 'preorder-address.json'
-            shop.write_private_json(config_path, store.data['address'])
             policy = Policy(service, store, config_path)
             service.preorder_policy = policy
-            failures = 0
-            while datetime.now(timezone.utc) < deadline:
-                service.channel.checkpoint()
+            prepared = None
+            if datetime.now(timezone.utc) < target and not deferred_until(store):
                 try:
-                    flow = PlanCheckout(session, policy)
-                    flow.page(shop.BASE_URL + '/shop/bag', '读取预购购物袋')
-                    if not shop.check_login(session, page=flow.page_response)['logged_in']:
-                        raise ValueError('开售时会话已失效，请重新登录后恢复计划。')
-                    items = shop.model_items(shop.field(flow.model, 'shoppingCart.items', {}))
-                    if any(sku.upper() != policy.plan['sku'] for sku, _ in items):
-                        raise ValueError('购物袋包含计划以外的商品，请先人工处理。')
-                    shop.add_to_bag(policy.plan['sku'], quantity=1, set_total=True, flow=flow)
-                    shop.configure_applecare(flow, policy.plan['sku'], policy.plan.get('applecare', False))
-                    result = shop.pay_bag(flow=flow, payment_method=policy.plan.get('payment_method', 'alipay'),
-                                          installment_term=policy.plan.get('installment_term'))
-                    policy.validate_result(result)
-                    store.save(state='confirmed', result=result, message='订单已创建，等待付款。')
-                    return result
-                except (requests.RequestException, shop.CartNotReady, shop.TemporaryCheckoutError, Unavailable):
-                    if store.data['state'] in SEALED:
-                        return reconcile(service, store, session)
-                    failures += 1
-                    service.stage('尚未完成加购或履约，读取当前状态后再试')
-                    remaining = max(0, (deadline - datetime.now(timezone.utc)).total_seconds())
-                    service.channel.cancelled.wait(min(2 ** min(failures, 4), 10, remaining))
-                except Exception:
-                    if store.data['state'] in SEALED:
-                        return reconcile(service, store, session)
-                    raise
-            store.save(state='expired', message='执行窗口结束，未创建订单。')
-            return store.public()
+                    prepare_session(service, store, session)
+                    prepared = warmup(service, session, policy)
+                except Exception as error:
+                    if not is_store_unavailable(error) and not isinstance(error, (requests.RequestException, shop.TemporaryCheckoutError)):
+                        raise
+                    # 403 等非暂时 HTTP 错误不会因发生在预热阶段而被忽略。
+                    retry_delay(error, target)
+                    defer_requests(store, error)
+                    service.stage('商城或预热暂不可用，开售后重新获取所需会话、订单基线和商品信息')
+            store.save(state='running', message='等待开售；未完成的准备将在正式执行时补齐。')
+            wait_until(service, target)
+            return purchase(service, store, session, policy, prepared=prepared)
         except BaseException:
             # 包括取消和 KeyboardInterrupt；断电仍由事先落盘的 submitting 保护。
             if store.data['state'] not in SEALED:

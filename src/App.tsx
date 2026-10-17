@@ -1068,6 +1068,12 @@ function Result({
               : "已保存的预购计划"}
         </h3>
         {result.order_number && <p>订单 {result.order_number}</p>}
+        {result.test_order_number && (
+          <p>预检测试订单 {result.test_order_number}（不付款、不自动取消）</p>
+        )}
+        {result.test_order_state === "skipped" && (
+          <p>预检测试订单已跳过：{result.test_order_message}</p>
+        )}
         {result.payment_label && <p>付款方式：{result.payment_label}</p>}
         {result.target_at && (
           <p>
@@ -1105,6 +1111,12 @@ function Result({
     return (
       <div className="payment">
         <h3>订单已创建，等待付款</h3>
+        {result.test_order_number && (
+          <p>预检测试订单 {result.test_order_number}（不付款、不自动取消）</p>
+        )}
+        {result.test_order_state === "skipped" && (
+          <p>预检测试订单已跳过：{result.test_order_message}</p>
+        )}
         <p>
           订单 {result.order_number || "请查询订单确认"}
           {result.amount_due && ` · ${result.amount_due}`}

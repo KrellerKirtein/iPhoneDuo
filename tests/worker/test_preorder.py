@@ -41,8 +41,17 @@ def params(**changes):
 class PurchaseFlow(FakeFlow):
     """跑真实 pay_bag/fulfillment/shipping，只有 HTTP 边界替换为模型转移。"""
     def __init__(self, session, policy):
-        super().__init__({'shoppingCart': {'items': {'item-phone': deepcopy(ITEM)},
-                         'summary': {'d': {'total': REVIEW['total']}},
+        self.item = deepcopy(ITEM)
+        self.item['d']['sku'] = policy.plan['sku']
+        self.test_order = isinstance(policy.store, preorder.TestOrderStore)
+        if self.test_order:
+            self.item['d'].update(name='测试 iPhone 18 Pro Max', totalPrice='RMB 10,999')
+        self.review = {**REVIEW, 'total': self.item['d']['totalPrice'], 'items': [
+            {'sku': policy.plan['sku'], 'name': self.item['d']['name'], 'quantity': 1}]}
+        self.payment = {**PAYMENT, 'amount_due': self.review['total'],
+                        'order_number': 'W111111111' if self.test_order else ORDER['order_number']}
+        super().__init__({'shoppingCart': {'items': {'item-phone': deepcopy(self.item)},
+                          'summary': {'d': {'total': self.review['total']}},
                          'actions': {'a': {'checkout': {'url': '/synthetic'}}}}}, mixed=False)
         self.session, self.policy = session, policy
         self.headers = {'x-aos-stk': 'synthetic'}
@@ -61,8 +70,8 @@ class PurchaseFlow(FakeFlow):
             pass
         elif name == 'continueFromBillingToReview':
             self.model = {'checkout': {'review': {
-                'fulfillmentReview': {'items': {'item-phone': deepcopy(ITEM)}},
-                'summary': {'d': {'total': REVIEW['total']}},
+                'fulfillmentReview': {'items': {'item-phone': deepcopy(self.item)}},
+                'summary': {'d': {'total': self.review['total']}},
                 'placeOrder': {'d': {'enableContinue': True}},
                 'billingReview': {'alipayReview': {'d': {'alipayLabel': 'ALIPAY'}}}},
                 'companionBar': {'orderDetails': {'shippingCompanionBar': {
@@ -70,13 +79,15 @@ class PurchaseFlow(FakeFlow):
         elif name == 'continueFromReviewToProcess':
             # 断言发送任何创建请求之前，磁盘上已存在完整提交意图。
             saved = preorder.PlanStore(self.policy.service.root).data
-            assert saved['state'] == 'submitting' and saved['review']['items'][0]['sku'] == SKU
+            if self.test_order:
+                saved = saved['test_order']
+            assert saved['state'] == 'submitting' and saved['review']['items'][0]['sku'] == self.policy.plan['sku']
             self.submissions += 1
             if self.failure:
                 raise self.failure
             self.url = shop.BASE_URL + '/shop/checkout/interstitial'
-            self.model = {'externalPayAuth': {'d': {'externalUrl': PAYMENT['payment_url'],
-                          'orderNumber': PAYMENT['order_number'], 'amountDue': PAYMENT['amount_due']}}}
+            self.model = {'externalPayAuth': {'d': {'externalUrl': self.payment['payment_url'],
+                          'orderNumber': self.payment['order_number'], 'amountDue': self.payment['amount_due']}}}
         else:
             super().action(module, name, data)
             if shop.field(self.model, 'checkout.billing') is not None:
@@ -238,17 +249,20 @@ class PreorderTests(unittest.TestCase):
         self.orders.return_value = {**EMPTY, 'orders': [ORDER]}
         self.assertEqual(preorder.reconcile(self.service, store, None)['status'], 'order_uncertain')
 
-    def test_schedule_preflight_before_target_and_no_early_cart(self):
+    def test_schedule_warms_cart_before_target_without_early_submission(self):
         target = datetime.now(timezone.utc) + timedelta(days=1)
         waits = []
         def waiting(service, value):
-            self.factory.assert_not_called()
+            if not waits:
+                self.factory.assert_not_called()
+            else:
+                self.assertEqual(self.flow.submissions, 0)
             waits.append(value)
             if len(waits) == 2:
                 raise Cancelled()
         with patch.object(preorder, 'wait_until', side_effect=waiting), self.assertRaises(Cancelled):
             self.service.run('preorder', params(target_at=target.isoformat()))
-        self.assertEqual(waits, [target - timedelta(seconds=30), target])
+        self.assertEqual(waits, [target - timedelta(seconds=10), target])
         self.orders.assert_called_once()
         self.assertEqual(preorder.PlanStore(self.root).data['state'], 'paused')
 

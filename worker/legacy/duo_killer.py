@@ -30,6 +30,7 @@ from alipay_qr import get_payment_qr
 import interaction
 from interaction import text_input as input
 from platform_support import private_fd
+from store_status import StoreClosedError, check_closed_page
 
 BASE_URL = "https://www.apple.com.cn"
 PART = "mlh74fe/A"  # 与最新成功 HAR 和用户提供的商品页面一致。
@@ -149,6 +150,7 @@ def request_get(session, stage, url, method="GET", **kwargs):
                 "[%s] 请求详情：%s", stage, json.dumps(detail, ensure_ascii=False))
     log.info("[%s] 完成，耗时 %.2fs，跳转 %s 次", stage, perf_counter() - started, len(response.history))
     remove_imported_cookie_duplicates(session)
+    check_closed_page(response)
     return response
 
 
@@ -578,6 +580,10 @@ class CartNotReady(ValueError):
 class TemporaryCheckoutError(ValueError):
     """瞬时服务错误；自动模式只允许在尚未提交订单时重新读取状态。"""
 
+    def __init__(self, message, *, response=None):
+        super().__init__(message)
+        self.response = response
+
 
 def add_to_bag(part=PART, quantity=1, *, set_total=False, flow=None):
     part = normalize_sku(part)
@@ -597,7 +603,10 @@ def add_to_bag(part=PART, quantity=1, *, set_total=False, flow=None):
             target = quantity if set_total else before + quantity
             if item is None:
                 # 商品尚未入袋时只加一件，随后读取真实 item ID、数量限制和更新 action。
-                add_error = _add_one_to_bag(session, part)
+                prepared = getattr(flow, 'prepared_add', None)
+                flow.prepared_add = None
+                add_error = (_add_one_to_bag(session, part, prepared=prepared, preserve_retry_after=True)
+                             if getattr(flow, 'policy', None) else _add_one_to_bag(session, part))
                 flow.page(BASE_URL + "/shop/bag", "首次加购后购物袋")
                 item_id, item = cart_item(flow, part)
                 if item is None:
@@ -714,7 +723,15 @@ def verify_applecare(flow, items):
         raise ValueError('订单 AppleCare 与购买选择不一致，已停止，未提交订单。')
 
 
-def _add_one_to_bag(session, part):
+def add_token(session, part):
+    """读取当前会话对目标商品实际发送的加购 Cookie，不保存或输出令牌值。"""
+    cookie_header = session.prepare_request(requests.Request("GET", BASE_URL + "/shop/product/" + part)).headers.get("Cookie", "")
+    return next(("".join(c.strip().split("=", 1)[1].split("|")[2:])
+                 for c in cookie_header.split(";") if c.strip().startswith("as_atb=")), "")
+
+
+def prepare_add_to_bag(session, part):
+    """只读取商品页及当前会话令牌，供定时计划在临开售时短暂复用；不执行加购。"""
     product_url = BASE_URL + "/shop/product/" + part
     session.headers.update({"Accept": "*/*", "Referer": product_url})
     product_page = request_get(session, "商品页", product_url)
@@ -725,17 +742,25 @@ def _add_one_to_bag(session, part):
         raise ValueError("商品页未提供加购 API key，可加 -log 查看详情。")
     beacon = request_get(session, "加购令牌", BASE_URL + "/shop/beacon/atb")
     beacon.raise_for_status()
-    cookie_header = session.prepare_request(requests.Request("GET", product_url)).headers.get("Cookie", "")
-    token = next(("".join(c.strip().split("=", 1)[1].split("|")[2:])
-                  for c in cookie_header.split(";") if c.strip().startswith("as_atb=")), "")
+    token = add_token(session, part)
     issued = next(("".join(c.value.split("|")[2:]) for c in beacon.cookies if c.name == "as_atb"), None)
     log.info("[加购令牌] 已取得=%s，长度=%s，与本次 beacon 一致=%s，as_atb 数量=%s",
              bool(token), len(token), token == issued if issued is not None else "本次未下发",
              sum(c.name == "as_atb" for c in session.cookies))
     if not token:
         raise ValueError(f"当前会话未取得 as_atb 加购令牌，请检查 {AUTH_PATH} 或加 -log 查看详情。")
+    return {'product': part, 'apikey': key[1], 'atbtoken': token, 'prepared_at': perf_counter()}
+
+
+def _add_one_to_bag(session, part, *, prepared=None, preserve_retry_after=False):
+    """只加购一次；预热信息仅在 15 秒内且当前 Cookie 未变时使用。"""
+    if (not prepared or prepared.get('product') != part
+            or not 0 <= perf_counter() - prepared.get('prepared_at', 0) <= 15
+            or not prepared.get('atbtoken') or prepared['atbtoken'] != add_token(session, part)):
+        prepared = prepare_add_to_bag(session, part)
+    session.headers.update({'Accept': '*/*', 'Referer': BASE_URL + '/shop/product/' + part})
     # 官网 acStore.addItem 使用的中国商城 JSON 接口。
-    params = {"product": part, "apikey": key[1], "atbtoken": token}
+    params = {key: prepared[key] for key in ('product', 'apikey', 'atbtoken')}
     # 加购只发送一次；导航或网络出错后查袋确认，不自动重试。
     add_error = ""
     try:
@@ -752,6 +777,10 @@ def _add_one_to_bag(session, part):
     except ValueError:
         add_error = "加购接口返回了无法识别的 JSON 响应。"
     except requests.RequestException as error:
+        if preserve_retry_after and isinstance(error, StoreClosedError):
+            raise
+        if preserve_retry_after and error.response is not None and error.response.status_code in (429, 502, 503, 504):
+            raise TemporaryCheckoutError('加购服务暂不可用，读取购物袋后再试。', response=error.response) from error
         add_error = (f"加购接口返回 HTTP {error.response.status_code}。"
                      if error.response is not None else "加购请求发生网络异常。")
     return add_error
@@ -860,8 +889,10 @@ class Checkout:
         response = request_get(self.session, name, self.apple_url(url), method="POST",
                                data=data or {}, headers=headers, allow_redirects=False)
         if response.status_code != 200:
-            error = TemporaryCheckoutError if response.status_code in (429, 502, 503, 504) else ValueError
-            raise error(f"{name} 返回 HTTP {response.status_code}，已停止。")
+            message = f"{name} 返回 HTTP {response.status_code}，已停止。"
+            if response.status_code in (429, 502, 503, 504):
+                raise TemporaryCheckoutError(message, response=response)
+            raise ValueError(message)
         try:
             result = response.json()
             status = str(result["head"]["status"])
@@ -1084,8 +1115,8 @@ def finish_payment(flow, payment=None):
     raise ValueError("订单仍在处理中，请稍后运行 -o 查询订单。")
 
 
-def pay_bag(*, flow=None, payment_method='alipay', installment_term=None):
-    """按用户付款选择创建订单，分期订单不获取二维码或执行付款。"""
+def pay_bag(*, flow=None, payment_method='alipay', installment_term=None, save_payment=True):
+    """按用户付款选择创建订单；预检测试不写正式订单的付款入口，也不付款。"""
     from payment_options import validate, select_billing, verify_review
     payment = validate(payment_method, installment_term)
     standalone = flow is None
@@ -1138,12 +1169,13 @@ def pay_bag(*, flow=None, payment_method='alipay', installment_term=None):
             result = finish_payment(flow, payment)
             if policy:
                 policy.validate_result(result)
-            if PAYMENT_ROOT is not None:
+            if save_payment and PAYMENT_ROOT is not None:
                 # Keep the issued payment link even if fetching its QR image is interrupted.
                 write_private_json(PAYMENT_ROOT / "payment.json", result)
-            if not policy and payment_method == 'alipay':
+            if save_payment and not policy and payment_method == 'alipay':
                 payment_qr(result)
-            write_private_json((PAYMENT_ROOT or ROOT) / "payment.json", result)
+            if save_payment:
+                write_private_json((PAYMENT_ROOT or ROOT) / "payment.json", result)
             return result
         finally:
             if standalone:

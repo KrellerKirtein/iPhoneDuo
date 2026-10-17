@@ -20,6 +20,7 @@ from srp import _pysrp as srp
 import interaction
 from interaction import text_input as input
 from platform_support import find_browser
+from store_status import StoreClosedError, is_closed_page
 
 HOME = "https://www.apple.com.cn/"
 AUTH = "https://idmsa.apple.com.cn/appleauth/auth"
@@ -37,6 +38,10 @@ class LoginError(Exception):
         super().__init__(message)
         self.status = status
         self.codes = tuple(codes)
+
+
+class BrowserContextError(LoginError):
+    """浏览器或官网页面准备失败，尚无证据表明账号凭据被拒绝。"""
 
 
 def is_credentials_error(error):
@@ -201,7 +206,7 @@ class AppleStoreLogin:
         if (profile / ".authx-541").exists():
             # 不移动仍被浏览器使用的配置，也不删除旧数据。
             if os.path.lexists(profile / "SingletonLock"):
-                raise LoginError("待重建的专用浏览器配置仍有进程锁，请先关闭该浏览器后重试。")
+                raise BrowserContextError("待重建的专用浏览器配置仍有进程锁，请先关闭该浏览器后重试。")
             backup = profile.with_name("native-rejected-" + uuid.uuid4().hex)
             profile.rename(backup)
             print(f"上次商城回调返回 541，旧浏览器配置已保留至 {backup}，本次重新取得上下文。")
@@ -217,11 +222,11 @@ class AppleStoreLogin:
         try:
             from playwright.sync_api import sync_playwright, Error as BrowserError
         except ImportError:
-            raise LoginError("首次获取浏览器 Cookie 需要 Playwright，请使用当前 Python 安装 requirements.txt。") from None
+            raise BrowserContextError("首次获取浏览器 Cookie 需要 Playwright，请使用当前 Python 安装 requirements.txt。") from None
         try:
             browser_executable = find_browser()
         except ValueError as error:
-            raise LoginError(str(error)) from None
+            raise BrowserContextError(str(error)) from None
         proxies = requests.utils.get_environ_proxies(HOME)
         proxy_url = proxies.get("https") or proxies.get("all")
         profile_root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -237,7 +242,7 @@ class AppleStoreLogin:
         if proxy_url:
             parsed = urlsplit(proxy_url)
             if parsed.username or parsed.password:
-                raise LoginError("自动获取上下文暂不支持需要账号密码的代理，请使用本机无认证代理。")
+                raise BrowserContextError("自动获取上下文暂不支持需要账号密码的代理，请使用本机无认证代理。")
             args.append("--proxy-server=" + proxy_url)
         print(f"正常启动浏览器 {browser_executable.name}，使用专用配置：{profile}。自动获取上下文后关闭并保留浏览器数据。")
         process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -248,7 +253,7 @@ class AppleStoreLogin:
                 deadline = time.monotonic() + 30
                 while browser is None:
                     if process.poll() is not None or time.monotonic() >= deadline:
-                        raise LoginError("未能连接脚本启动的浏览器，请关闭占用专用配置的浏览器后重试。")
+                        raise BrowserContextError("未能连接脚本启动的浏览器，请关闭占用专用配置的浏览器后重试。")
                     try:
                         browser = playwright.chromium.connect_over_cdp(
                             f"http://127.0.0.1:{port}", timeout=1000, no_defaults=True)
@@ -258,10 +263,21 @@ class AppleStoreLogin:
                     context = browser.contexts[0]
                     page = context.pages[0] if context.pages else context.new_page()
                     # 两个页面仍完成正常加载；Cookie 就绪后立即继续，不固定等待十秒。
-                    for url in (HOME, HOME + "shop/bag"):
+                    for label, url in (("官网首页", HOME), ("购物袋", HOME + "shop/bag")):
                         reply = page.goto(url, wait_until="load", timeout=45000)
-                        if reply is None or reply.status >= 400:
-                            raise LoginError("浏览器未能正常打开官网页面，未更新上下文。")
+                        status = reply.status if reply is not None else None
+                        log.info("[浏览器上下文] %s HTTP %s", label, status if status is not None else "无响应")
+                        if status is None:
+                            raise BrowserContextError(f"浏览器未取得{label}响应，未更新上下文；请稍后重试。")
+                        if status >= 400:
+                            hint = "Apple 商城暂时不可用，请稍后重试。" if status >= 500 else "请检查官网页面后重试。"
+                            error = BrowserContextError(f"{label}返回 HTTP {status}，未更新浏览器上下文。{hint}", status=status)
+                            error.retry_after = reply.headers.get('retry-after')
+                            raise error
+                        if is_closed_page(reply.text()):
+                            error = StoreClosedError('Apple 商城尚未开放，正在准备预购，请稍后重试。')
+                            error.retry_after = reply.headers.get('retry-after')
+                            raise error
                     for _ in range(80):
                         cookies = context.cookies()
                         if any(c["name"] == "shld_bt_ck" and c["value"]
@@ -270,7 +286,7 @@ class AppleStoreLogin:
                             break
                         page.wait_for_timeout(250)
                     else:
-                        raise LoginError("浏览器尚未取得所需浏览器上下文，已停止；请检查浏览器页面或代理后重试。")
+                        raise BrowserContextError("浏览器尚未取得所需浏览器上下文，已停止；请检查浏览器页面或代理后重试。")
                     user_agent = page.evaluate("navigator.userAgent")
                 finally:
                     # 关闭专用配置中本次及历史恢复的标签页，避免下次启动继续累积。
@@ -286,7 +302,7 @@ class AppleStoreLogin:
                     except BrowserError:
                         pass
         except BrowserError:
-            raise LoginError("浏览器初始化失败，请检查网络/代理及专用浏览器配置。") from None
+            raise BrowserContextError("浏览器初始化失败，请检查网络/代理及专用浏览器配置。") from None
         finally:
             try:
                 process.wait(timeout=10)
@@ -424,9 +440,11 @@ class AppleStoreLogin:
         if response.status_code not in allowed or errors:
             codes = [str(x.get("code", "")) for x in (errors or []) if isinstance(x, dict)]
             codes = [x for x in codes if re.fullmatch(r"[-A-Za-z0-9_]{1,64}", x)]
-            raise LoginError(f"请求失败：HTTP {response.status_code}，错误代码 {codes}。"
-                             "未输出响应正文，以免泄露账号或令牌。",
-                             status=response.status_code, codes=codes)
+            error = LoginError(f"请求失败：HTTP {response.status_code}，错误代码 {codes}。"
+                               "未输出响应正文，以免泄露账号或令牌。",
+                               status=response.status_code, codes=codes)
+            error.retry_after = response.headers.get('Retry-After')
+            raise error
         return data
 
     def remember_headers(self, response):
@@ -642,7 +660,13 @@ class AppleStoreLogin:
     def login(self, account, password, sms=False, *, signin_url=None, signin_response=None):
         try:
             return self._login(account, password, sms, signin_url=signin_url, signin_response=signin_response)
+        except (BrowserContextError, StoreClosedError):
+            # 页面准备失败不清除已有登录 Cookie，也不标记账号认证失败。
+            raise
         except (LoginError, requests.RequestException, EOFError, KeyboardInterrupt) as error:
+            if isinstance(error, LoginError) and error.status == 503:
+                # 商城关闭期间的登录回调也可能返回 503，不能据此清理认证。
+                raise
             self.discard_failed_login(error)
             if isinstance(error, LoginError) and (error.status is None or error.status in (400, 401, 403, 409, 541)):
                 interaction.report_stage("重新认证未通过", authentication_failed=True)

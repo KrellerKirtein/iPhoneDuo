@@ -143,6 +143,55 @@ class SharedCartTests(unittest.TestCase):
         add.assert_not_called()
         pay.assert_not_called()
 
+    def test_fresh_add_preparation_skips_product_and_beacon_requests(self):
+        with requests.Session() as session:
+            session.cookies.set('as_atb', 'a|b|current', domain='.apple.com.cn', path='/')
+            prepared = {'product': 'MLH74FE/A', 'apikey': 'prepared-key', 'atbtoken': 'current', 'prepared_at': 100}
+            response = self.response({'addedToBag': True}, duo_killer.BASE_URL + '/cn/shop/bag/add')
+            with patch.object(duo_killer, 'perf_counter', return_value=110), \
+                    patch.object(duo_killer, 'prepare_add_to_bag') as prepare, \
+                    patch.object(duo_killer, 'request_get', return_value=response) as request:
+                self.assertEqual(duo_killer._add_one_to_bag(session, 'MLH74FE/A', prepared=prepared), '')
+            prepare.assert_not_called()
+            request.assert_called_once()
+            self.assertEqual(request.call_args.args[1], '执行加购')
+            self.assertEqual(request.call_args.kwargs['params']['apikey'], 'prepared-key')
+
+    def test_expired_or_changed_cookie_never_replays_prepared_token(self):
+        with requests.Session() as session:
+            session.cookies.set('as_atb', 'a|b|current', domain='.apple.com.cn', path='/')
+            response = self.response({'addedToBag': True}, duo_killer.BASE_URL + '/cn/shop/bag/add')
+            fresh = {'product': 'MLH74FE/A', 'apikey': 'new-key', 'atbtoken': 'new-token', 'prepared_at': 120}
+            for age, token in ((16, 'current'), (1, 'old-token')):
+                prepared = {'product': 'MLH74FE/A', 'apikey': 'old-key', 'atbtoken': token, 'prepared_at': 120 - age}
+                with self.subTest(age=age, token=token), patch.object(duo_killer, 'perf_counter', return_value=120), \
+                        patch.object(duo_killer, 'prepare_add_to_bag', return_value=fresh) as prepare, \
+                        patch.object(duo_killer, 'request_get', return_value=response) as request:
+                    duo_killer._add_one_to_bag(session, 'MLH74FE/A', prepared=prepared)
+                prepare.assert_called_once_with(session, 'MLH74FE/A')
+                self.assertEqual(request.call_args.kwargs['params']['atbtoken'], 'new-token')
+
+    def test_add_rate_limit_keeps_retry_after_for_scheduler(self):
+        with requests.Session() as session:
+            prepared = {'product': 'MLH74FE/A', 'apikey': 'key', 'atbtoken': 'token', 'prepared_at': 100}
+            response = self.response({}, duo_killer.BASE_URL + '/cn/shop/bag/add')
+            response.status_code = 429
+            response.headers['Retry-After'] = '60'
+            with patch.object(duo_killer, 'prepare_add_to_bag', return_value=prepared), \
+                    patch.object(duo_killer, 'request_get', return_value=response), \
+                    self.assertRaises(duo_killer.TemporaryCheckoutError) as caught:
+                duo_killer._add_one_to_bag(session, 'MLH74FE/A', preserve_retry_after=True)
+            self.assertIs(caught.exception.response, response)
+
+    def test_manual_add_keeps_read_bag_recovery_on_rate_limit(self):
+        with requests.Session() as session:
+            response = self.response({}, duo_killer.BASE_URL + '/cn/shop/bag/add')
+            response.status_code = 429
+            with patch.object(duo_killer, 'prepare_add_to_bag', return_value={
+                    'product': 'MLH74FE/A', 'apikey': 'key', 'atbtoken': 'token'}), \
+                    patch.object(duo_killer, 'request_get', return_value=response):
+                self.assertEqual(duo_killer._add_one_to_bag(session, 'MLH74FE/A'), '加购接口返回 HTTP 429。')
+
 
 if __name__ == '__main__':
     unittest.main()

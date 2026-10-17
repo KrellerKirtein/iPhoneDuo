@@ -434,6 +434,7 @@ test("scheduled purchase freezes Beijing time and stops at pending payment", asy
     pickup_stores: ["R390", "R401"],
     id_suffix: "123X",
     authorized: true,
+    test_order_authorized: true,
     window_seconds: 300,
   });
   await expect(
@@ -453,10 +454,14 @@ test("scheduled purchase freezes Beijing time and stops at pending payment", asy
         status: "pending_payment",
         order_number: "W123456789",
         amount_due: "RMB 21,499",
+        test_order_number: "W111111111",
       },
     });
   });
   await expect(page.getByText("订单已创建，等待付款")).toBeVisible();
+  await expect(
+    page.getByText("预检测试订单 W111111111（不付款、不自动取消）"),
+  ).toBeVisible();
   await expect(page.getByRole("button", { name: "获取二维码" })).toBeVisible();
   expect(
     await page.evaluate(() =>
@@ -464,6 +469,51 @@ test("scheduled purchase freezes Beijing time and stops at pending payment", asy
     ),
   ).toEqual([]);
 });
+
+for (const status of ["preorder_plan", "pending_payment"]) {
+  test(`skipped preflight remains explicit in ${status}`, async ({ page }) => {
+    await fixture(page);
+    await page.goto("/");
+    await enterWorkspace(page);
+    await expect(
+      page.getByText(/跳过测试并继续正式抢购；此时未验证 Cookie/),
+    ).toBeVisible();
+    await page.getByRole("button", { name: "恢复已保存计划" }).click();
+    await page.evaluate((resultStatus) => {
+      const root = window as any;
+      const task = root.started.find(
+        (task: any) => task.action === "preorder_resume",
+      );
+      root.finish(task.id, {
+        status: "succeeded",
+        order_submitted: resultStatus === "pending_payment",
+        result: {
+          success: true,
+          status: resultStatus,
+          state: "expired",
+          order_number:
+            resultStatus === "pending_payment" ? "W123456789" : null,
+          test_order_state: "skipped",
+          test_order_message: "商城未开放，未验证 Cookie。",
+        },
+      });
+    }, status);
+    await expect(
+      page.getByText("预检测试订单已跳过：商城未开放，未验证 Cookie。"),
+    ).toBeVisible();
+    await expect(page.getByText(/预检测试订单 W/)).toHaveCount(0);
+    if (status === "pending_payment") {
+      await expect(page.getByText("订单已创建，等待付款")).toBeVisible();
+      await expect(
+        page.getByRole("button", { name: "获取二维码" }),
+      ).toBeVisible();
+    } else {
+      await expect(
+        page.getByRole("button", { name: "获取二维码" }),
+      ).toHaveCount(0);
+    }
+  });
+}
 
 test("uncertain order stays visible and resume is explicit", async ({
   page,

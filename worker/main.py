@@ -11,6 +11,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / 'legacy'))
 from protocol import Channel, LogStream, Cancelled
 
 
+def error_message(error):
+    """只显示安全的错误类型和 HTTP 状态，避免输出含令牌的请求 URL。"""
+    import requests
+    from store_status import StoreClosedError
+    if isinstance(error, StoreClosedError):
+        return 'Apple 商城尚未开放，正在准备预购，请稍后重试；未判定账号失效。'
+    if isinstance(error, requests.HTTPError) and error.response is not None:
+        status = error.response.status_code
+        if status == 429:
+            return 'Apple 商城请求受限（HTTP 429），请稍后重试；未判定账号失效。'
+        if status >= 500:
+            return f'Apple 商城暂时不可用（HTTP {status}），请稍后重试；未判定账号失效。'
+        return f'Apple 商城请求失败（HTTP {status}），请检查官网状态后重试。'
+    if isinstance(error, requests.RequestException):
+        return '网络请求失败，请检查网络或系统代理。'
+    if isinstance(error, (ValueError, OSError)):
+        return str(error)
+    return f'操作未完成（{type(error).__name__}），请查看任务阶段。'
+
+
 class AccountLock:
     def __init__(self, path):
         self.file = open(path, 'a+b')
@@ -80,10 +100,7 @@ def main():
     except Exception as exc:
         error = exc
         # Never include requests' exception URLs, headers, or a traceback with locals.
-        import requests
-        message = '网络请求失败，请检查网络或系统代理。' if isinstance(exc, requests.RequestException) else str(exc)
-        if not isinstance(exc, (ValueError, OSError)):
-            message = f'操作未完成（{type(exc).__name__}），请查看任务阶段。'
+        message = error_message(exc)
         if service and service.submitted:
             message += ' 订单提交结果可能未确认，请查询订单后再决定下一步。'
         channel.emit('error', message=message[:2000], order_submitted=bool(service and service.submitted),

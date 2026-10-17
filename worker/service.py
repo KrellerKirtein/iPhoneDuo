@@ -18,6 +18,18 @@ def empty_auth(account):
             ('account_session', 'server_managed', 'with_expiry', 'expiry_unknown')}, 'trust_cookies': []}
 
 
+def is_environment_failure(error):
+    """网络、浏览器准备和服务异常不能作为账号失效或重新认证的依据。"""
+    from apple_login import BrowserContextError, LoginError
+    for cause in (error, getattr(error, '__cause__', None)):
+        if isinstance(cause, (requests.RequestException, duo_killer.TemporaryCheckoutError, BrowserContextError)):
+            return True
+        if (isinstance(cause, LoginError) and cause.status is not None
+                and (cause.status == 429 or cause.status >= 500 and cause.status != 541)):
+            return True
+    return False
+
+
 class Service:
     def __init__(self, channel, account_dir, task_dir, account, vault=None):
         self.channel, self.root, self.task_dir, self.account = channel, account_dir, task_dir, account
@@ -149,11 +161,8 @@ class Service:
         self.password = None
 
     def should_remove_account(self, error):
-        from apple_login import LoginError
-        cause = getattr(error, '__cause__', None)
-        if (isinstance(error, requests.RequestException) or
-                isinstance(cause, LoginError) and cause.status is not None
-                and (cause.status == 429 or cause.status >= 500 and cause.status != 541)):
+        """只沿用明确认证失败的移除规则，保留环境或服务异常下的账号。"""
+        if is_environment_failure(error):
             return False
         return (self.action != 'enroll' and self.authentication_failed
                 and isinstance(error, ValueError) and not self.submitted)
@@ -171,10 +180,10 @@ class Service:
                 try:
                     # Keep -me's account-page reauthentication and current SSI/session.
                     result = duo_killer.account_info(session)
-                except (ValueError, requests.RequestException):
+                except (ValueError, requests.RequestException) as error:
                     # Wrong passwords, rejected OTPs and a failed reauthentication must
                     # reach the user instead of starting another login loop.
-                    if enrolling or self.authentication_requested:
+                    if is_environment_failure(error) or enrolling or self.authentication_requested:
                         raise
                     result = None
                 if (not result or result.get('success') is not True
@@ -193,8 +202,8 @@ class Service:
                         or not result.get('apple_id')):
                     raise ValueError('无法确认当前登录人，未启用此账号。')
                 return result
-            except ValueError:
-                if not enrolling and (retried or self.authentication_requested):
+            except ValueError as error:
+                if not is_environment_failure(error) and not enrolling and (retried or self.authentication_requested):
                     self.authentication_failed = True
                 raise
             finally:

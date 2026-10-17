@@ -480,6 +480,58 @@ class LoginTests(unittest.TestCase):
 
 
 class BrowserInitializationTests(unittest.TestCase):
+    def test_reauthentication_context_failure_does_not_discard_authentication(self):
+        from apple_login import BrowserContextError
+        from store_status import StoreClosedError
+        for error in (BrowserContextError('page unavailable', status=503),
+                      StoreClosedError('closed'), LoginError('callback unavailable', status=503)):
+            with self.subTest(error=type(error).__name__):
+                client = AppleStoreLogin()
+                client.session.cookies.set('as_ltn_cn', 'existing', domain='.apple.com.cn', path='/')
+                with patch.object(client, '_login', side_effect=error), \
+                        patch.object(client, 'discard_failed_login') as discard, \
+                        patch('apple_login.interaction.report_stage') as stage:
+                    with self.assertRaises(type(error)):
+                        client.login('a@example.test', 'synthetic')
+                discard.assert_not_called()
+                stage.assert_not_called()
+                self.assertEqual(client.session.cookies.get('as_ltn_cn'), 'existing')
+
+    def test_unavailable_store_preserves_http_status_and_current_context(self):
+        with tempfile.TemporaryDirectory() as temp, patch("playwright.sync_api.sync_playwright") as factory, \
+                patch("apple_login.subprocess.Popen") as process_factory, \
+                patch("apple_login.Path.is_file", return_value=True), \
+                patch("requests.utils.get_environ_proxies", return_value={}):
+            process_factory.return_value.poll.return_value = None
+            client = AppleStoreLogin(auth_path=Path(temp) / "auth.json")
+            client.session.cookies.set("as_ltn_cn", "existing", domain=".apple.com.cn", path="/")
+            browser = factory.return_value.__enter__.return_value.chromium.connect_over_cdp.return_value
+            context = browser.contexts[0]
+            browser.contexts = [context]
+            page = unittest.mock.MagicMock()
+            context.pages = [page]
+            page.goto.side_effect = [unittest.mock.Mock(status=200), unittest.mock.Mock(status=503)]
+            with self.assertRaises(LoginError) as caught:
+                client.initialize_browser_context()
+            self.assertEqual(caught.exception.status, 503)
+            self.assertIn('购物袋', str(caught.exception))
+            self.assertIn('503', str(caught.exception))
+            self.assertEqual(client.session.cookies.get("as_ltn_cn"), "existing")
+            context.cookies.assert_not_called()
+            page.close.assert_called_once()
+            browser.new_browser_cdp_session.return_value.send.assert_called_once_with("Browser.close")
+
+            from store_status import StoreClosedError
+            closed = unittest.mock.Mock(status=200, headers={'retry-after': '120'})
+            closed.text.return_value = '<script>{"coversModeType": "preorder_full"}</script>'
+            page.goto.side_effect = [closed]
+            with self.assertRaises(StoreClosedError) as caught:
+                client.initialize_browser_context()
+            self.assertEqual(caught.exception.retry_after, '120')
+            self.assertEqual(client.session.cookies.get("as_ltn_cn"), "existing")
+            context.cookies.assert_not_called()
+            self.assertEqual(page.close.call_count, 2)
+
     def test_authx_541_marks_context_without_retry_or_overwriting_auth(self):
         for status in (541, 401, 500):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as temp:

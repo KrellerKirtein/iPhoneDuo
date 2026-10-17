@@ -70,6 +70,7 @@ export function PreorderForm({
             pickup_stores: pickupStores,
             id_suffix: suffix,
             authorized,
+            test_order_authorized: authorized,
           });
         }}
       >
@@ -154,8 +155,18 @@ export function PreorderForm({
           )}
         </div>
         <p className="muted">
+          开售前 5 分钟会尝试实际创建一笔 iPhone 18 Pro Max 256GB 黑色
+          （MJY64CH/A）测试订单：1 件、不带 AppleCare、总额上限 10,999 元，
+          使用以上地址和付款方式，不付款、不自动取消。测试确认后继续等待正式抢购。
+          商城未开放或返回 503
+          且测试尚未提交时，跳过测试并继续正式抢购；此时未验证 Cookie。
+          预热遇到商城暂不可用时，开售后再获取所需信息。
+          请提前清空购物袋，等待期间不要在其他设备修改；建议提前 5 分钟启用，
+          晚于开售前 1 分钟启用时跳过测试。
+        </p>
+        <p className="muted">
           仅在官网明确没有可用配送服务时尝试备选门店。执行窗口结束后停止。
-          需要取货预约时，选择官网返回的首个可用时段。
+          需要取货预约时，选择官网返回的首个可用时段。 到货日期不作为下单条件。
           提交结果不明时只查单，不重新购买；重启后点击“恢复已保存计划”。
         </p>
         <label className="preorder-consent">
@@ -165,8 +176,8 @@ export function PreorderForm({
             onChange={(event) => setAuthorized(event.target.checked)}
           />
           {maximum.trim()
-            ? "我授权按以上商品、地址和金额上限自动创建一笔订单，付款由我完成"
-            : "我授权按以上商品和地址自动创建一笔订单，不设金额上限，付款由我完成"}
+            ? "我授权创建上述一笔测试订单（不付款），并按以上商品、地址和金额上限创建一笔正式订单，正式订单由我付款"
+            : "我授权创建上述一笔测试订单（不付款），并按以上商品和地址创建一笔正式订单，正式订单不设金额上限且由我付款"}
         </label>
         {error && <p role="alert">{error}</p>}
         <div className="button-row">
